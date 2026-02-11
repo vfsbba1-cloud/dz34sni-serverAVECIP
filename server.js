@@ -350,7 +350,7 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
 </div>
 
 <!-- URL spoof -->
-<script>try{history.replaceState({},'','/DZA/appointment/LivenessRequest');}catch(e){}</script>
+<!-- URL kept as /oz-page to avoid routing issues -->
 
 <!-- ═══ CRITICAL: Intercept ALL ozforensics.com requests → route through server proxy ═══ -->
 <script>
@@ -557,6 +557,14 @@ app.get('/debug', (req, res) => {
         })),
         ipMap: phoneIpMap
     });
+});
+
+// Catch-all for /DZA/* paths (WebView may navigate here after replaceState)
+app.all('/DZA/*', (req, res) => {
+    res.redirect('/oz-done');
+});
+app.all('/dza/*', (req, res) => {
+    res.redirect('/oz-done');
 });
 
 // ═══════════════════════════════════════════
