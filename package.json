@@ -1,0 +1,17 @@
+{
+  "name": "dz34sni-server",
+  "version": "3.0.0",
+  "description": "DZ34SNI Liveness Relay Server with OZ Proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
