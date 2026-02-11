@@ -150,7 +150,7 @@ app.options('/oz-proxy/*', (req, res) => {
 app.all('/oz-proxy/:phone/*', async (req, res) => {
     const phone = req.params.phone;
     const realIp = phoneIpMap[phone] || '';
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip.onrender.com';
     const proxyBase = `${serverUrl}/oz-proxy/${encodeURIComponent(phone)}/`;
     
     // Build target URL
@@ -257,7 +257,7 @@ app.get('/oz-page', (req, res) => {
 
     if (phone && realIp) phoneIpMap[phone] = realIp;
 
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip.onrender.com';
     const proxyBase = `${serverUrl}/oz-proxy/${encodeURIComponent(phone || '')}`;
 
     const html = `<!DOCTYPE html>
@@ -398,8 +398,9 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
     <input type="hidden" name="LivenessId" id="LivenessId" value="">
 </form>
 
-<!-- Load OZ SDK via server proxy -->
-<script src="${proxyBase}/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
+<!-- Load OZ SDK DIRECTLY from CDN (SDK checks hostname, can't proxy it) -->
+<!-- API requests will be intercepted by fetch/XHR overrides and routed through proxy -->
+<script src="https://web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
 
 <!-- Launch liveness after SDK loads -->
 <script>
