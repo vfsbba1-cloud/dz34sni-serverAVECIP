@@ -288,6 +288,119 @@ app.all('/oz-proxy/:phone/*', (req, res) => {
             res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
             res.setHeader('Access-Control-Allow-Headers', '*');
 
+            // ★ SDK PATCH: If this is plugin_liveness.php, intercept and prepend origin spoof ★
+            const isSDK = fullPath.includes('plugin_liveness') || (proxyRes.headers['content-type'] && proxyRes.headers['content-type'].includes('javascript') && fullPath.includes('plugin'));
+            
+            if (isSDK && req.method === 'GET') {
+                const sdkChunks = [];
+                proxyRes.on('data', c => sdkChunks.push(c));
+                proxyRes.on('end', () => {
+                    const sdkBuf = Buffer.concat(sdkChunks);
+                    
+                    // Prepend origin spoof that runs BEFORE the SDK
+                    const originSpoof = `
+/* DZ34SNI Origin Spoof v2 — runs before OZ SDK */
+(function(){
+    var BLS='https://algeria.blsspainglobal.com';
+    var BLS_PATH='/dza/appointment/LivenessRequest';
+    var BLS_FULL=BLS+BLS_PATH;
+    
+    /* Strategy 1: Override window.origin and self.origin */
+    try{Object.defineProperty(window,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}
+    try{Object.defineProperty(self,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}
+    if(typeof globalThis!=='undefined'){try{Object.defineProperty(globalThis,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}}
+    
+    /* Strategy 2: Override location properties via defineProperty */
+    var props=['origin','hostname','host','protocol','href','pathname'];
+    var vals=[BLS,'algeria.blsspainglobal.com','algeria.blsspainglobal.com','https:',BLS_FULL,BLS_PATH];
+    for(var i=0;i<props.length;i++){
+        try{Object.defineProperty(window.location,props[i],{get:(function(v){return function(){return v};})(vals[i]),configurable:true});}catch(e){}
+    }
+    
+    /* Strategy 3: Intercept property access on globalThis */
+    /* The SDK does: B1[16]=X[...] which resolves to globalThis */
+    /* Then: B1[16].location.href */
+    /* We wrap globalThis to intercept .location access */
+    if(typeof Proxy!=='undefined'){
+        try{
+            var realGT=typeof globalThis!=='undefined'?globalThis:window;
+            var fakeLocation={
+                href:BLS_FULL,origin:BLS,hostname:'algeria.blsspainglobal.com',
+                host:'algeria.blsspainglobal.com',protocol:'https:',
+                pathname:BLS_PATH,search:'',hash:'',port:'',
+                ancestorOrigins:{length:0},
+                assign:function(u){window.location.assign(u);},
+                replace:function(u){window.location.replace(u);},
+                reload:function(){window.location.reload();},
+                toString:function(){return BLS_FULL;}
+            };
+            /* Patch the global scope variable that SDK stores early */
+            var origGTGetter=Object.getOwnPropertyDescriptor(window,'location');
+            if(origGTGetter&&origGTGetter.get){
+                /* Cannot override location getter in most browsers */
+                /* But we can override on the prototype chain */
+            }
+        }catch(e){}
+    }
+    
+    /* Strategy 4: Override document.domain */
+    try{Object.defineProperty(document,'domain',{get:function(){return 'algeria.blsspainglobal.com';},configurable:true});}catch(e){}
+    
+    /* Strategy 5: Monkey-patch the SDK's internal globalThis resolution */
+    /* The SDK starts with: X[603998]=(function(){...return globalThis...}) */
+    /* It tries globalThis first. We ensure globalThis.location returns our fake */
+    /* Since we can't override window.location getter, we override the result: */
+    /* The SDK stores the ref in X.f_ then reads X.f_.href */
+    /* If the SDK uses a variable like: var loc = window.location; loc.href */
+    /* we need to patch window.location ITSELF */
+    
+    /* Final fallback: Create a wrapper that intercepts href reads */
+    /* by hooking into the Location prototype */
+    try{
+        var LocProto=Object.getPrototypeOf(window.location);
+        if(LocProto){
+            var origHrefDesc=Object.getOwnPropertyDescriptor(LocProto,'href');
+            if(origHrefDesc&&origHrefDesc.get){
+                Object.defineProperty(LocProto,'href',{
+                    get:function(){return BLS_FULL;},
+                    set:origHrefDesc.set,
+                    configurable:true
+                });
+            }
+            var origOriginDesc=Object.getOwnPropertyDescriptor(LocProto,'origin');
+            if(origOriginDesc&&origOriginDesc.get){
+                Object.defineProperty(LocProto,'origin',{
+                    get:function(){return BLS;},
+                    configurable:true
+                });
+            }
+            var origHostnameDesc=Object.getOwnPropertyDescriptor(LocProto,'hostname');
+            if(origHostnameDesc&&origHostnameDesc.get){
+                Object.defineProperty(LocProto,'hostname',{
+                    get:function(){return 'algeria.blsspainglobal.com';},
+                    configurable:true
+                });
+            }
+        }
+    }catch(e){}
+    
+    console.log('[DZ34SNI] Origin spoof v2 active');
+    try{console.log('[DZ34SNI] window.origin='+window.origin);}catch(e){}
+    try{console.log('[DZ34SNI] location.href='+window.location.href);}catch(e){}
+    try{console.log('[DZ34SNI] location.origin='+window.location.origin);}catch(e){}
+})();
+`;
+                    const patchedSdk = Buffer.concat([Buffer.from(originSpoof, 'utf8'), sdkBuf]);
+                    
+                    // Update content-length
+                    res.setHeader('Content-Length', patchedSdk.length);
+                    res.status(proxyRes.statusCode);
+                    res.end(patchedSdk);
+                    console.log(`[PROXY] 🔧 SDK patched with origin spoof (${originSpoof.length} bytes prepended)`);
+                });
+                return; // Don't fall through to other handlers
+            }
+
             // ★ CAPTURE: Save response body ★
             if (isCapture && captureId && req.method === 'POST') {
                 const resChunks = [];
