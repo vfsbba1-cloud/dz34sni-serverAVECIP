@@ -243,7 +243,43 @@ app.all('/oz-proxy/:phone/*', (req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
-        const bodyBuf = chunks.length > 0 ? Buffer.concat(chunks) : null;
+        let bodyBuf = chunks.length > 0 ? Buffer.concat(chunks) : null;
+
+        // ★ BODY REWRITE: Replace our server URL with BLS URL in ALL request bodies ★
+        // The OZ SDK collects location.href and sends it in telemetry/license check
+        // We must replace our domain with BLS domain in the body
+        if (bodyBuf) {
+            const serverHost = (process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip-1.onrender.com').replace('https://', '');
+            
+            // Use latin1 to safely handle binary data mixed with text
+            let bodyStr = bodyBuf.toString('latin1');
+            let changed = false;
+            
+            // Replace any occurrence of our server URL with BLS
+            if (bodyStr.includes(serverHost) || bodyStr.includes('onrender.com')) {
+                bodyStr = bodyStr.split(serverHost).join('algeria.blsspainglobal.com');
+                bodyStr = bodyStr.split('dz34sni-serveravecip-1.onrender.com').join('algeria.blsspainglobal.com');
+                changed = true;
+            }
+            
+            // Fix paths
+            if (bodyStr.includes('/pre-selfie') || bodyStr.includes('/oz-page')) {
+                bodyStr = bodyStr.split('/pre-selfie').join('/dza/appointment/LivenessRequest');
+                bodyStr = bodyStr.split('/oz-page').join('/dza/appointment/LivenessRequest');
+                changed = true;
+            }
+
+            // Replace proxy URL pattern
+            if (bodyStr.includes('/oz-proxy/')) {
+                bodyStr = bodyStr.replace(/https?:\/\/[^/]*\/oz-proxy\/[^/]*\//g, 'https://');
+                changed = true;
+            }
+            
+            if (changed) {
+                bodyBuf = Buffer.from(bodyStr, 'latin1');
+                console.log(`[PROXY] 📝 Body rewritten: replaced server URLs with BLS domain`);
+            }
+        }
 
         const h = {
             'Host': parsedUrl.hostname,
@@ -288,117 +324,36 @@ app.all('/oz-proxy/:phone/*', (req, res) => {
             res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
             res.setHeader('Access-Control-Allow-Headers', '*');
 
-            // ★ SDK PATCH: If this is plugin_liveness.php, intercept and prepend origin spoof ★
+            // ★ SDK PATCH: Replace location.href read with hardcoded BLS URL ★
             const isSDK = fullPath.includes('plugin_liveness') || (proxyRes.headers['content-type'] && proxyRes.headers['content-type'].includes('javascript') && fullPath.includes('plugin'));
             
             if (isSDK && req.method === 'GET') {
                 const sdkChunks = [];
                 proxyRes.on('data', c => sdkChunks.push(c));
                 proxyRes.on('end', () => {
-                    const sdkBuf = Buffer.concat(sdkChunks);
+                    let sdkCode = Buffer.concat(sdkChunks).toString('utf8');
                     
-                    // Prepend origin spoof that runs BEFORE the SDK
-                    const originSpoof = `
-/* DZ34SNI Origin Spoof v2 — runs before OZ SDK */
-(function(){
-    var BLS='https://algeria.blsspainglobal.com';
-    var BLS_PATH='/dza/appointment/LivenessRequest';
-    var BLS_FULL=BLS+BLS_PATH;
-    
-    /* Strategy 1: Override window.origin and self.origin */
-    try{Object.defineProperty(window,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}
-    try{Object.defineProperty(self,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}
-    if(typeof globalThis!=='undefined'){try{Object.defineProperty(globalThis,'origin',{value:BLS,writable:false,configurable:true});}catch(e){}}
-    
-    /* Strategy 2: Override location properties via defineProperty */
-    var props=['origin','hostname','host','protocol','href','pathname'];
-    var vals=[BLS,'algeria.blsspainglobal.com','algeria.blsspainglobal.com','https:',BLS_FULL,BLS_PATH];
-    for(var i=0;i<props.length;i++){
-        try{Object.defineProperty(window.location,props[i],{get:(function(v){return function(){return v};})(vals[i]),configurable:true});}catch(e){}
-    }
-    
-    /* Strategy 3: Intercept property access on globalThis */
-    /* The SDK does: B1[16]=X[...] which resolves to globalThis */
-    /* Then: B1[16].location.href */
-    /* We wrap globalThis to intercept .location access */
-    if(typeof Proxy!=='undefined'){
-        try{
-            var realGT=typeof globalThis!=='undefined'?globalThis:window;
-            var fakeLocation={
-                href:BLS_FULL,origin:BLS,hostname:'algeria.blsspainglobal.com',
-                host:'algeria.blsspainglobal.com',protocol:'https:',
-                pathname:BLS_PATH,search:'',hash:'',port:'',
-                ancestorOrigins:{length:0},
-                assign:function(u){window.location.assign(u);},
-                replace:function(u){window.location.replace(u);},
-                reload:function(){window.location.reload();},
-                toString:function(){return BLS_FULL;}
-            };
-            /* Patch the global scope variable that SDK stores early */
-            var origGTGetter=Object.getOwnPropertyDescriptor(window,'location');
-            if(origGTGetter&&origGTGetter.get){
-                /* Cannot override location getter in most browsers */
-                /* But we can override on the prototype chain */
-            }
-        }catch(e){}
-    }
-    
-    /* Strategy 4: Override document.domain */
-    try{Object.defineProperty(document,'domain',{get:function(){return 'algeria.blsspainglobal.com';},configurable:true});}catch(e){}
-    
-    /* Strategy 5: Monkey-patch the SDK's internal globalThis resolution */
-    /* The SDK starts with: X[603998]=(function(){...return globalThis...}) */
-    /* It tries globalThis first. We ensure globalThis.location returns our fake */
-    /* Since we can't override window.location getter, we override the result: */
-    /* The SDK stores the ref in X.f_ then reads X.f_.href */
-    /* If the SDK uses a variable like: var loc = window.location; loc.href */
-    /* we need to patch window.location ITSELF */
-    
-    /* Final fallback: Create a wrapper that intercepts href reads */
-    /* by hooking into the Location prototype */
-    try{
-        var LocProto=Object.getPrototypeOf(window.location);
-        if(LocProto){
-            var origHrefDesc=Object.getOwnPropertyDescriptor(LocProto,'href');
-            if(origHrefDesc&&origHrefDesc.get){
-                Object.defineProperty(LocProto,'href',{
-                    get:function(){return BLS_FULL;},
-                    set:origHrefDesc.set,
-                    configurable:true
-                });
-            }
-            var origOriginDesc=Object.getOwnPropertyDescriptor(LocProto,'origin');
-            if(origOriginDesc&&origOriginDesc.get){
-                Object.defineProperty(LocProto,'origin',{
-                    get:function(){return BLS;},
-                    configurable:true
-                });
-            }
-            var origHostnameDesc=Object.getOwnPropertyDescriptor(LocProto,'hostname');
-            if(origHostnameDesc&&origHostnameDesc.get){
-                Object.defineProperty(LocProto,'hostname',{
-                    get:function(){return 'algeria.blsspainglobal.com';},
-                    configurable:true
-                });
-            }
-        }
-    }catch(e){}
-    
-    console.log('[DZ34SNI] Origin spoof v2 active');
-    try{console.log('[DZ34SNI] window.origin='+window.origin);}catch(e){}
-    try{console.log('[DZ34SNI] location.href='+window.location.href);}catch(e){}
-    try{console.log('[DZ34SNI] location.origin='+window.location.origin);}catch(e){}
-})();
-`;
-                    const patchedSdk = Buffer.concat([Buffer.from(originSpoof, 'utf8'), sdkBuf]);
+                    // PATCH: The SDK reads location.href via "X.f_.href" (only 1 occurrence)
+                    // Replace with hardcoded BLS URL so license check passes
+                    const original = 'X.f_.href';
+                    const replacement = "'https://algeria.blsspainglobal.com/dza/appointment/LivenessRequest'";
                     
-                    // Update content-length
-                    res.setHeader('Content-Length', patchedSdk.length);
+                    if (sdkCode.includes(original)) {
+                        sdkCode = sdkCode.replace(original, replacement);
+                        console.log('[PROXY] 🔧 SDK PATCHED: replaced X.f_.href with BLS URL');
+                    } else {
+                        // Fallback: try other patterns
+                        if (sdkCode.includes('.href')) {
+                            console.log('[PROXY] ⚠️ SDK has .href but not X.f_.href pattern');
+                        }
+                    }
+                    
+                    const patchedBuf = Buffer.from(sdkCode, 'utf8');
+                    res.setHeader('Content-Length', patchedBuf.length);
                     res.status(proxyRes.statusCode);
-                    res.end(patchedSdk);
-                    console.log(`[PROXY] 🔧 SDK patched with origin spoof (${originSpoof.length} bytes prepended)`);
+                    res.end(patchedBuf);
                 });
-                return; // Don't fall through to other handlers
+                return;
             }
 
             // ★ CAPTURE: Save response body ★
@@ -872,44 +827,6 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh;color:
     <a href="/dashboard" style="display:inline-block;margin-top:20px;padding:12px 24px;background:rgba(255,255,255,.2);color:#fff;border-radius:10px;text-decoration:none;font-weight:700">← Dashboard</a>
 </div>
 
-<!-- CRITICAL: Spoof window.origin BEFORE SDK loads — OZ checks this for license -->
-<script>
-(function(){
-    // Override window.origin to match BLS domain (license is bound to this origin)
-    try {
-        Object.defineProperty(window, 'origin', {
-            value: 'https://algeria.blsspainglobal.com',
-            writable: false,
-            configurable: true
-        });
-    } catch(e) {}
-    // Also override location.origin via a getter
-    try {
-        var _loc = window.location;
-        Object.defineProperty(_loc, 'origin', {
-            get: function() { return 'https://algeria.blsspainglobal.com'; },
-            configurable: true
-        });
-    } catch(e) {}
-    // Override document.location.origin
-    try {
-        Object.defineProperty(document, 'domain', {
-            get: function() { return 'algeria.blsspainglobal.com'; },
-            configurable: true
-        });
-    } catch(e) {}
-    // Override self.origin
-    try {
-        Object.defineProperty(self, 'origin', {
-            value: 'https://algeria.blsspainglobal.com',
-            writable: false,
-            configurable: true
-        });
-    } catch(e) {}
-    console.log('[DZ34SNI] Origin spoofed to:', window.origin);
-})();
-</script>
-
 <!-- URL spoof for OZ SDK -->
 <script>try{history.replaceState({},'','/dza/appointment/LivenessRequest');}catch(e){}</script>
 
@@ -1375,14 +1292,6 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
 
 <div id="st">Initialisation proxy...</div>
 
-<script>
-(function(){
-    try { Object.defineProperty(window, 'origin', { value: 'https://algeria.blsspainglobal.com', writable: false, configurable: true }); } catch(e) {}
-    try { Object.defineProperty(window.location, 'origin', { get: function() { return 'https://algeria.blsspainglobal.com'; }, configurable: true }); } catch(e) {}
-    try { Object.defineProperty(self, 'origin', { value: 'https://algeria.blsspainglobal.com', writable: false, configurable: true }); } catch(e) {}
-    try { Object.defineProperty(document, 'domain', { get: function() { return 'algeria.blsspainglobal.com'; }, configurable: true }); } catch(e) {}
-})();
-</script>
 <script>try{history.replaceState({},'','/dza/appointment/LivenessRequest');}catch(e){}</script>
 
 <script>
