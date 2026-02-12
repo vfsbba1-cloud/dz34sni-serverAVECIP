@@ -759,6 +759,44 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh;color:
     <a href="/dashboard" style="display:inline-block;margin-top:20px;padding:12px 24px;background:rgba(255,255,255,.2);color:#fff;border-radius:10px;text-decoration:none;font-weight:700">← Dashboard</a>
 </div>
 
+<!-- CRITICAL: Spoof window.origin BEFORE SDK loads — OZ checks this for license -->
+<script>
+(function(){
+    // Override window.origin to match BLS domain (license is bound to this origin)
+    try {
+        Object.defineProperty(window, 'origin', {
+            value: 'https://algeria.blsspainglobal.com',
+            writable: false,
+            configurable: true
+        });
+    } catch(e) {}
+    // Also override location.origin via a getter
+    try {
+        var _loc = window.location;
+        Object.defineProperty(_loc, 'origin', {
+            get: function() { return 'https://algeria.blsspainglobal.com'; },
+            configurable: true
+        });
+    } catch(e) {}
+    // Override document.location.origin
+    try {
+        Object.defineProperty(document, 'domain', {
+            get: function() { return 'algeria.blsspainglobal.com'; },
+            configurable: true
+        });
+    } catch(e) {}
+    // Override self.origin
+    try {
+        Object.defineProperty(self, 'origin', {
+            value: 'https://algeria.blsspainglobal.com',
+            writable: false,
+            configurable: true
+        });
+    } catch(e) {}
+    console.log('[DZ34SNI] Origin spoofed to:', window.origin);
+})();
+</script>
+
 <!-- URL spoof for OZ SDK -->
 <script>try{history.replaceState({},'','/dza/appointment/LivenessRequest');}catch(e){}</script>
 
@@ -1224,6 +1262,14 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
 
 <div id="st">Initialisation proxy...</div>
 
+<script>
+(function(){
+    try { Object.defineProperty(window, 'origin', { value: 'https://algeria.blsspainglobal.com', writable: false, configurable: true }); } catch(e) {}
+    try { Object.defineProperty(window.location, 'origin', { get: function() { return 'https://algeria.blsspainglobal.com'; }, configurable: true }); } catch(e) {}
+    try { Object.defineProperty(self, 'origin', { value: 'https://algeria.blsspainglobal.com', writable: false, configurable: true }); } catch(e) {}
+    try { Object.defineProperty(document, 'domain', { get: function() { return 'algeria.blsspainglobal.com'; }, configurable: true }); } catch(e) {}
+})();
+</script>
 <script>try{history.replaceState({},'','/dza/appointment/LivenessRequest');}catch(e){}</script>
 
 <script>
