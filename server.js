@@ -906,8 +906,8 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh;color:
     <input type="hidden" name="LivenessId" id="LivenessId" value="">
 </form>
 
-<!-- Load OZ SDK -->
-<script src="https://web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
+<!-- Load OZ SDK through proxy (enables origin patching) -->
+<script src="${serverUrl}/oz-proxy/${encodeURIComponent(captureSession)}/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
 
 <!-- Launch and capture -->
 <script>
@@ -1369,7 +1369,7 @@ body{background:#0f172a;font-family:system-ui,sans-serif;min-height:100vh}
     <input type="hidden" name="LivenessId" id="LivenessId" value="">
 </form>
 
-<script src="https://web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
+<script src="${serverUrl}/oz-proxy/${encodeURIComponent(ph)}/web-sdk.prod.cdn.spain.ozforensics.com/blsinternational/plugin_liveness.php"></script>
 
 <script>
 var __ph = '${ph}', __srv = '${serverUrl}', __sent = false;
